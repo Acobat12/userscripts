@@ -125,6 +125,14 @@ const settingsDefinition = /** @type {const} */ [
 		nodeType: "Toggle",
 	},
 	{
+		name: "theme_mode",
+		type: "string",
+		values: ["auto", "dark", "light"],
+		default: "auto",
+		group: "general",
+		nodeType: "select",
+	},
+	{
 		name: "global_active",
 		type: "boolean",
 		local: true,

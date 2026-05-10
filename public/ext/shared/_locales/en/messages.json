@@ -85,6 +85,24 @@
 	"settings_global_active_desc": {
 		"message": "Toggle on/off script injection for the pages you visit"
 	},
+	"settings_theme_mode": {
+		"message": "Theme mode"
+	},
+	"settings_theme_mode_desc": {
+		"message": "Toggle theme mode"
+	},
+	"settings_theme_mode_auto": {
+		"message": "Auto (System)"
+	},
+	"settings_theme_mode_dark": {
+		"message": "Dark"
+	},
+	"settings_theme_mode_light": {
+		"message": "Light"
+	},
+	"settings_theme_mode_custom": {
+		"message": "Custom"
+	},
 	"settings_global_exclude_match": {
 		"message": "Global Exclude Match patterns"
 	},
