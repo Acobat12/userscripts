@@ -9,12 +9,18 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
 
       - run: npm ci
+
+      - name: Add fallback tag
+        run: git tag v4.8.6 || true
 
       - run: npm run build:mac-safari-15
 
