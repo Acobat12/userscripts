@@ -26,10 +26,6 @@ jobs:
       - name: Build web assets
         run: npm run build:mac-safari-15
 
-      - name: List Xcode schemes
-        run: |
-          xcodebuild -list -project xcode/Userscripts.xcodeproj
-
       - name: Build Xcode app
         run: |
           xcodebuild \
@@ -41,21 +37,10 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
 
-      - name: Show build output
-        run: |
-          echo "===== BUILD ====="
-          find build -maxdepth 6 | sort
-
-          echo
-          echo "===== APPS ====="
-          find . -name "*.app"
-
-          echo
-          echo "===== APPEX ====="
-          find . -name "*.appex"
-
-      - name: Upload build directory
+      - name: Upload build products
         uses: actions/upload-artifact@v4
         with:
-          name: BuildProducts
-          path: build
+          name: Userscripts-build
+          path: |
+            build/Build/Products/Debug/Userscripts-Debug.app
+            build/Build/Products/Debug/Userscripts-Mac-Safari-Extension.appex
