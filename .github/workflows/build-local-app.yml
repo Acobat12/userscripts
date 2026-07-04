@@ -1,4 +1,4 @@
-nname: Build local macOS app
+name: Build local macOS app
 
 on:
   workflow_dispatch:
