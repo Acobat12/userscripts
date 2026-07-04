@@ -16,7 +16,7 @@ jobs:
 
       - run: npm ci
 
-      - run: npm run build:mac
+      - run: npm run build:mac-safari-15
 
       - name: Build Xcode app
         run: |
