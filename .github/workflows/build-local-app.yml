@@ -1,4 +1,4 @@
-name: Build local macOS app
+nname: Build local macOS app
 
 on:
   workflow_dispatch:
@@ -17,12 +17,18 @@ jobs:
         with:
           node-version: 22
 
-      - run: npm ci
+      - name: Install dependencies
+        run: npm ci
 
       - name: Add fallback tag
         run: git tag v4.8.6 || true
 
-      - run: npm run build:mac-safari-15
+      - name: Build web assets
+        run: npm run build:mac-safari-15
+
+      - name: List Xcode schemes
+        run: |
+          xcodebuild -list -project xcode/Userscripts.xcodeproj
 
       - name: Build Xcode app
         run: |
@@ -35,8 +41,21 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
 
-      - name: Upload app
+      - name: Show build output
+        run: |
+          echo "===== BUILD ====="
+          find build -maxdepth 6 | sort
+
+          echo
+          echo "===== APPS ====="
+          find . -name "*.app"
+
+          echo
+          echo "===== APPEX ====="
+          find . -name "*.appex"
+
+      - name: Upload build directory
         uses: actions/upload-artifact@v4
         with:
-          name: Userscripts.app
-          path: build/Build/Products/Debug/Userscripts.app
+          name: BuildProducts
+          path: build
