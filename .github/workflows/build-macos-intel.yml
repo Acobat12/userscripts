@@ -1,4 +1,4 @@
-name: Userscripts-Debug-macOS-Intel-adhoc
+name: Build macOS Intel app
 
 on:
   workflow_dispatch:
