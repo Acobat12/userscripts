@@ -1,0 +1,36 @@
+name: Build local macOS app
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - run: npm ci
+
+      - run: npm run build:mac
+
+      - name: Build Xcode app
+        run: |
+          xcodebuild \
+            -project xcode/Userscripts.xcodeproj \
+            -scheme Mac \
+            -configuration Debug \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Upload app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Userscripts.app
+          path: build/Build/Products/Debug/Userscripts.app
