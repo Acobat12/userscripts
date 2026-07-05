@@ -23,6 +23,182 @@ function pageGrantBridgeEventName(id, type) {
 	return `__userscripts_page_grant_bridge_${id}_${type}__`;
 }
 
+function __US_getTypedArrayConstructor(viewName) {
+	const typedArrayConstructors = {
+		Int8Array,
+		Uint8Array,
+		Uint8ClampedArray,
+		Int16Array,
+		Uint16Array,
+		Int32Array,
+		Uint32Array,
+		Float32Array,
+		Float64Array,
+		BigInt64Array:
+			typeof BigInt64Array === "function" ? BigInt64Array : undefined,
+		BigUint64Array:
+			typeof BigUint64Array === "function" ? BigUint64Array : undefined,
+		DataView,
+	};
+	return typedArrayConstructors[viewName] || Uint8Array;
+}
+
+function __US_restoreTypedArrayView(data, viewName) {
+	const bytes = new Uint8Array(Array.isArray(data) ? data : []);
+	const TypedArrayConstructor = __US_getTypedArrayConstructor(viewName);
+	if (TypedArrayConstructor === DataView) {
+		return new DataView(bytes.buffer);
+	}
+	if (
+		typeof TypedArrayConstructor?.BYTES_PER_ELEMENT === "number" &&
+		TypedArrayConstructor.BYTES_PER_ELEMENT > 0 &&
+		bytes.byteLength % TypedArrayConstructor.BYTES_PER_ELEMENT === 0
+	) {
+		return new TypedArrayConstructor(bytes.buffer);
+	}
+	return bytes;
+}
+
+async function __US_serializeBridgeRequestData(value) {
+	if (typeof value === "undefined") return undefined;
+	if (typeof value === "string") {
+		return { __userscriptsRequestType: "Text", data: value };
+	}
+	if (
+		typeof ReadableStream === "function" &&
+		value instanceof ReadableStream
+	) {
+		throw new Error("ReadableStream is not supported by XMLHttpRequest");
+	}
+	if (value instanceof Document) {
+		if (value instanceof XMLDocument) {
+			return {
+				__userscriptsRequestType: "Document",
+				data: new XMLSerializer().serializeToString(value),
+				mimeType: value.contentType || "text/xml",
+			};
+		}
+		let html = value.documentElement?.outerHTML || "";
+		if (value.doctype) {
+			html = `<!doctype ${value.doctype.name}>${html}`;
+		}
+		return {
+			__userscriptsRequestType: "Document",
+			data: html,
+			mimeType: value.contentType || "text/html",
+		};
+	}
+	if (typeof File === "function" && value instanceof File) {
+		return {
+			__userscriptsRequestType: "File",
+			data: Array.from(new Uint8Array(await value.arrayBuffer())),
+			mimeType: value.type || "",
+			name: value.name,
+			lastModified: value.lastModified,
+		};
+	}
+	if (value instanceof Blob) {
+		return {
+			__userscriptsRequestType: "Blob",
+			data: Array.from(new Uint8Array(await value.arrayBuffer())),
+			mimeType: value.type || "",
+		};
+	}
+	if (value instanceof ArrayBuffer) {
+		return {
+			__userscriptsRequestType: "ArrayBuffer",
+			data: Array.from(new Uint8Array(value)),
+		};
+	}
+	if (ArrayBuffer.isView(value)) {
+		return {
+			__userscriptsRequestType: "ArrayBufferView",
+			data: Array.from(
+				new Uint8Array(value.buffer, value.byteOffset, value.byteLength),
+			),
+			view: value.constructor?.name || "Uint8Array",
+		};
+	}
+	if (value instanceof FormData) {
+		const entries = [];
+		for (const [key, entryValue] of value.entries()) {
+			if (typeof entryValue === "string") {
+				entries.push([key, entryValue]);
+			} else {
+				entries.push([key, await __US_serializeBridgeRequestData(entryValue)]);
+			}
+		}
+		return {
+			__userscriptsRequestType: "FormData",
+			data: entries,
+		};
+	}
+	if (value instanceof URLSearchParams) {
+		return {
+			__userscriptsRequestType: "URLSearchParams",
+			data: value.toString(),
+		};
+	}
+	return value;
+}
+
+function __US_restoreBridgeRequestData(value) {
+	if (
+		!value ||
+		typeof value !== "object" ||
+		!value.__userscriptsRequestType
+	) {
+		return value;
+	}
+	switch (value.__userscriptsRequestType) {
+		case "Text":
+			return String(value.data ?? "");
+		case "Document": {
+			const parser = new DOMParser();
+			const mimeType =
+				typeof value.mimeType === "string" && value.mimeType.includes("html")
+					? "text/html"
+					: "text/xml";
+			return parser.parseFromString(String(value.data || ""), mimeType);
+		}
+		case "File": {
+			const fileBytes = new Uint8Array(Array.isArray(value.data) ? value.data : []);
+			if (typeof File === "function") {
+				return new File([fileBytes], value.name || "file", {
+					type: value.mimeType || "",
+					lastModified: Number(value.lastModified) || Date.now(),
+				});
+			}
+			return new Blob([fileBytes], { type: value.mimeType || "" });
+		}
+		case "Blob":
+			return new Blob(
+				[new Uint8Array(Array.isArray(value.data) ? value.data : [])],
+				{ type: value.mimeType || "" },
+			);
+		case "ArrayBuffer":
+			return new Uint8Array(Array.isArray(value.data) ? value.data : []).buffer;
+		case "ArrayBufferView":
+			return __US_restoreTypedArrayView(value.data, value.view);
+		case "FormData": {
+			const formData = new FormData();
+			for (const [key, entryValue] of Array.isArray(value.data) ? value.data : []) {
+				formData.append(
+					key,
+					typeof entryValue === "string"
+						? entryValue
+						: __US_restoreBridgeRequestData(entryValue),
+				);
+			}
+			return formData;
+		}
+		case "URLSearchParams":
+			return new URLSearchParams(String(value.data || ""));
+		default:
+			return value;
+	}
+}
+
 const PAGE_BRIDGE_FILENAME_BOUND_METHODS = new Set([
 	"setValue",
 	"getValue",
@@ -137,6 +313,15 @@ async function serializeXhrResponseValue(value, responseType, contentType) {
 			view: value.constructor?.name || "Uint8Array",
 		};
 	}
+	if (typeof File === "function" && value instanceof File) {
+		return {
+			__userscriptsType: "File",
+			data: Array.from(new Uint8Array(await value.arrayBuffer())),
+			mimeType: value.type || contentType || "",
+			name: value.name,
+			lastModified: value.lastModified,
+		};
+	}
 	if (value instanceof Blob) {
 		return {
 			__userscriptsType: "Blob",
@@ -221,6 +406,9 @@ function installPageGrantBridge(userscript, grants) {
 		try {
 			if (normalizePageGrantMethod(method) === "GM_xmlhttpRequest") {
 				const details = { ...(args[0] || {}) };
+				if ("data" in details) {
+					details.data = __US_restoreBridgeRequestData(details.data);
+				}
 				for (const handler of [
 					"onreadystatechange",
 					"onloadstart",
@@ -294,6 +482,10 @@ function getPageGrantClientPreamble(userscript) {
 		`const __US_ABORT_EVENT__ = ${JSON.stringify(bridge.abortEvent)};\n` +
 		`const GM_info = ${JSON.stringify(info)};\n` +
 		`const GM = { info: GM_info };\n` +
+		`${__US_getTypedArrayConstructor.toString()}\n` +
+		`${__US_restoreTypedArrayView.toString()}\n` +
+		`${__US_serializeBridgeRequestData.toString()}\n` +
+		`${__US_restoreBridgeRequestData.toString()}\n` +
 		`const __US_randomId = () => Date.now().toString(36) + '_' + Math.random().toString(36).slice(2);\n` +
 		`const __US_terminalXhrHandlers = new Set(['onloadend','onabort','onerror','ontimeout']);\n` +
 		`const __US_parseHeaders = (raw) => {\n` +
@@ -309,7 +501,14 @@ function getPageGrantClientPreamble(userscript) {
 		`  if (!value || typeof value !== 'object' || !value.__userscriptsType) return value;\n` +
 		`  const mimeType = contentType || (__US_parseHeaders(responseHeaders)['content-type'] || '');\n` +
 		`  if (value.__userscriptsType === 'ArrayBuffer') return new Uint8Array(value.data || []).buffer;\n` +
-		`  if (value.__userscriptsType === 'ArrayBufferView') return new Uint8Array(value.data || []);\n` +
+		`  if (value.__userscriptsType === 'ArrayBufferView') return __US_restoreTypedArrayView(value.data, value.view);\n` +
+		`  if (value.__userscriptsType === 'File') {\n` +
+		`    const fileBytes = new Uint8Array(value.data || []);\n` +
+		`    if (typeof File === 'function') {\n` +
+		`      return new File([fileBytes], value.name || 'file', { type: value.mimeType || mimeType || '', lastModified: Number(value.lastModified) || Date.now() });\n` +
+		`    }\n` +
+		`    return new Blob([fileBytes], { type: value.mimeType || mimeType || '' });\n` +
+		`  }\n` +
 		`  if (value.__userscriptsType === 'Blob') return new Blob([new Uint8Array(value.data || [])], { type: value.mimeType || mimeType || '' });\n` +
 		`  if (value.__userscriptsType === 'Document') {\n` +
 		`    const parser = new DOMParser();\n` +
@@ -348,6 +547,8 @@ function getPageGrantClientPreamble(userscript) {
 				`  const id = __US_randomId();\n` +
 				`  const callbacks = {};\n` +
 				`  const payload = { ...(details || {}) };\n` +
+				`  let requestStarted = false;\n` +
+				`  let requestCancelled = false;\n` +
 				`  for (const key of ['onreadystatechange','onloadstart','onprogress','onabort','onerror','onload','ontimeout','onloadend']) {\n` +
 				`    if (typeof payload[key] === 'function') { callbacks[key] = payload[key]; delete payload[key]; }\n` +
 				`  }\n` +
@@ -366,8 +567,20 @@ function getPageGrantClientPreamble(userscript) {
 				`    }\n` +
 				`  };\n` +
 				`  document.addEventListener(__US_RESPONSE_EVENT__, onResponse);\n` +
-				`  document.dispatchEvent(new CustomEvent(__US_REQUEST_EVENT__, { detail: { bridgeId: __US_BRIDGE_ID__, id, method: 'GM_xmlhttpRequest', args: [payload] } }));\n` +
-				`  return { abort() { document.removeEventListener(__US_RESPONSE_EVENT__, onResponse); document.dispatchEvent(new CustomEvent(__US_ABORT_EVENT__, { detail: { bridgeId: __US_BRIDGE_ID__, id } })); } };\n` +
+				`  (async () => {\n` +
+				`    try {\n` +
+				`      if ('data' in payload) payload.data = await __US_serializeBridgeRequestData(payload.data);\n` +
+				`      if (requestCancelled) return;\n` +
+				`      requestStarted = true;\n` +
+				`      document.dispatchEvent(new CustomEvent(__US_REQUEST_EVENT__, { detail: { bridgeId: __US_BRIDGE_ID__, id, method: 'GM_xmlhttpRequest', args: [payload] } }));\n` +
+				`    } catch (error) {\n` +
+				`      document.removeEventListener(__US_RESPONSE_EVENT__, onResponse);\n` +
+				`      const errorObj = { error: String(error?.message || error) };\n` +
+				`      if (typeof callbacks.onerror === 'function') callbacks.onerror(errorObj);\n` +
+				`      if (typeof callbacks.onloadend === 'function') callbacks.onloadend(errorObj);\n` +
+				`    }\n` +
+				`  })();\n` +
+				`  return { abort() { document.removeEventListener(__US_RESPONSE_EVENT__, onResponse); if (!requestStarted) { requestCancelled = true; return; } document.dispatchEvent(new CustomEvent(__US_ABORT_EVENT__, { detail: { bridgeId: __US_BRIDGE_ID__, id } })); } };\n` +
 				`}\n` +
 				`GM.xmlHttpRequest = (details) => new Promise((resolve, reject) => {\n` +
 				`  GM_xmlhttpRequest({ ...(details || {}), onloadend: resolve, onerror: reject, ontimeout: reject, onabort: reject });\n` +
