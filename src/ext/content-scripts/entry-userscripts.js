@@ -1,5 +1,4 @@
 import USAPI from "./api.js";
-import { colors } from "@shared/colors.js";
 
 // code received from background page will be stored in this variable
 // code referenced again when strict CSPs block initial injection attempt
@@ -15,6 +14,224 @@ function randomLabel() {
 	const a = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 	const r = Math.random();
 	return a[Math.floor(r * a.length)] + r.toString().slice(5, 6);
+}
+
+
+
+function pageGrantBridgeEventName(id, type) {
+	return `__userscripts_page_grant_bridge_${id}_${type}__`;
+}
+
+function serializableXhrResponse(response) {
+	if (!response || typeof response !== "object") return response;
+	const result = {};
+	for (const key of [
+		"readyState",
+		"responseHeaders",
+		"responseText",
+		"responseType",
+		"responseURL",
+		"finalUrl",
+		"status",
+		"statusText",
+	]) {
+		if (key in response) result[key] = response[key];
+	}
+	if ("response" in response) {
+		const value = response.response;
+		if (
+			typeof value === "string" ||
+			typeof value === "number" ||
+			typeof value === "boolean" ||
+			value == null
+		) {
+			result.response = value;
+		} else {
+			result.response = response.responseText ?? undefined;
+		}
+	}
+	return result;
+}
+
+function installPageGrantBridge(userscript, grants) {
+	const filename = userscript.scriptObject.filename;
+	const bridgeId = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+	const requestEvent = pageGrantBridgeEventName(bridgeId, "request");
+	const responseEvent = pageGrantBridgeEventName(bridgeId, "response");
+	const abortEvent = pageGrantBridgeEventName(bridgeId, "abort");
+	const xhrControls = new Map();
+
+	const respond = (id, payload) => {
+		document.dispatchEvent(
+			new CustomEvent(responseEvent, {
+				detail: { id, ...payload },
+			}),
+		);
+	};
+
+	const handleRequest = async (event) => {
+		const detail = event.detail;
+		if (!detail || detail.bridgeId !== bridgeId || !detail.id) return;
+		const { id, method, args = [] } = detail;
+		try {
+			if (method === "GM_xmlhttpRequest") {
+				const details = { ...(args[0] || {}) };
+				for (const handler of [
+					"onreadystatechange",
+					"onloadstart",
+					"onprogress",
+					"onabort",
+					"onerror",
+					"onload",
+					"ontimeout",
+					"onloadend",
+				]) {
+					details[handler] = (response) => {
+						respond(id, {
+							type: "xhr-event",
+							handler,
+							response: serializableXhrResponse(response),
+						});
+					};
+				}
+				const control = USAPI.GM_xmlhttpRequest(details);
+				xhrControls.set(id, control);
+				return;
+			}
+
+			if (method === "GM_addStyle" || method === "addStyle") {
+				const result = USAPI.addStyle(String(args[0] || ""));
+				respond(id, { type: "result", result });
+				return;
+			}
+
+			if (method === "GM_setValue" || method === "setValue") {
+				const result = await USAPI.setValue.bind({ US_filename: filename })(
+					args[0],
+					args[1],
+				);
+				respond(id, { type: "result", result });
+				return;
+			}
+
+			if (method === "GM_getValue" || method === "getValue") {
+				const result = await USAPI.getValue.bind({ US_filename: filename })(
+					args[0],
+					args[1],
+				);
+				respond(id, { type: "result", result });
+				return;
+			}
+
+			if (method === "GM_deleteValue" || method === "deleteValue") {
+				const result = await USAPI.deleteValue.bind({ US_filename: filename })(
+					args[0],
+				);
+				respond(id, { type: "result", result });
+				return;
+			}
+
+			if (method === "GM_listValues" || method === "listValues") {
+				const result = await USAPI.listValues.bind({ US_filename: filename })();
+				respond(id, { type: "result", result });
+				return;
+			}
+
+			respond(id, {
+				type: "error",
+				error: `Unsupported bridged grant: ${method}`,
+			});
+		} catch (error) {
+			respond(id, {
+				type: "error",
+				error: String(error?.message || error),
+			});
+		}
+	};
+
+	const handleAbort = (event) => {
+		const detail = event.detail;
+		if (!detail || detail.bridgeId !== bridgeId || !detail.id) return;
+		const control = xhrControls.get(detail.id);
+		if (control && typeof control.abort === "function") control.abort();
+		xhrControls.delete(detail.id);
+	};
+
+	document.addEventListener(requestEvent, handleRequest);
+	document.addEventListener(abortEvent, handleAbort);
+
+	userscript.pageGrantBridge = {
+		bridgeId,
+		requestEvent,
+		responseEvent,
+		abortEvent,
+		grants: [...grants],
+	};
+}
+
+function getPageGrantClientPreamble(userscript) {
+	const bridge = userscript.pageGrantBridge;
+	if (!bridge) return "";
+	const info = userscript.apis?.GM?.info || userscript.apis?.GM_info || {};
+	return `(() => {\n` +
+		`const __US_BRIDGE_ID__ = ${JSON.stringify(bridge.bridgeId)};\n` +
+		`const __US_REQUEST_EVENT__ = ${JSON.stringify(bridge.requestEvent)};\n` +
+		`const __US_RESPONSE_EVENT__ = ${JSON.stringify(bridge.responseEvent)};\n` +
+		`const __US_ABORT_EVENT__ = ${JSON.stringify(bridge.abortEvent)};\n` +
+		`const GM_info = ${JSON.stringify(info)};\n` +
+		`const GM = { info: GM_info };\n` +
+		`const __US_randomId = () => Date.now().toString(36) + '_' + Math.random().toString(36).slice(2);\n` +
+		`const __US_callGrant = (method, args = []) => new Promise((resolve, reject) => {\n` +
+		`  const id = __US_randomId();\n` +
+		`  const onResponse = (event) => {\n` +
+		`    const detail = event.detail || {};\n` +
+		`    if (detail.id !== id) return;\n` +
+		`    if (detail.type === 'result') { document.removeEventListener(__US_RESPONSE_EVENT__, onResponse); resolve(detail.result); }\n` +
+		`    if (detail.type === 'error') { document.removeEventListener(__US_RESPONSE_EVENT__, onResponse); reject(new Error(detail.error || 'Userscripts grant bridge error')); }\n` +
+		`  };\n` +
+		`  document.addEventListener(__US_RESPONSE_EVENT__, onResponse);\n` +
+		`  document.dispatchEvent(new CustomEvent(__US_REQUEST_EVENT__, { detail: { bridgeId: __US_BRIDGE_ID__, id, method, args } }));\n` +
+		`});\n` +
+		`function GM_xmlhttpRequest(details) {\n` +
+		`  const id = __US_randomId();\n` +
+		`  const callbacks = {};\n` +
+		`  const payload = { ...(details || {}) };\n` +
+		`  for (const key of ['onreadystatechange','onloadstart','onprogress','onabort','onerror','onload','ontimeout','onloadend']) {\n` +
+		`    if (typeof payload[key] === 'function') { callbacks[key] = payload[key]; delete payload[key]; }\n` +
+		`  }\n` +
+		`  const onResponse = (event) => {\n` +
+		`    const detail = event.detail || {};\n` +
+		`    if (detail.id !== id) return;\n` +
+		`    if (detail.type === 'xhr-event') {\n` +
+		`      const cb = callbacks[detail.handler];\n` +
+		`      if (typeof cb === 'function') cb(detail.response);\n` +
+		`      if (['onloadend','onabort','onerror','ontimeout'].includes(detail.handler)) document.removeEventListener(__US_RESPONSE_EVENT__, onResponse);\n` +
+		`      return;\n` +
+		`    }\n` +
+		`    if (detail.type === 'error') {\n` +
+		`      document.removeEventListener(__US_RESPONSE_EVENT__, onResponse);\n` +
+		`      if (typeof callbacks.onerror === 'function') callbacks.onerror({ error: detail.error });\n` +
+		`    }\n` +
+		`  };\n` +
+		`  document.addEventListener(__US_RESPONSE_EVENT__, onResponse);\n` +
+		`  document.dispatchEvent(new CustomEvent(__US_REQUEST_EVENT__, { detail: { bridgeId: __US_BRIDGE_ID__, id, method: 'GM_xmlhttpRequest', args: [payload] } }));\n` +
+		`  return { abort() { document.dispatchEvent(new CustomEvent(__US_ABORT_EVENT__, { detail: { bridgeId: __US_BRIDGE_ID__, id } })); } };\n` +
+		`}\n` +
+		`const GM_addStyle = (css) => __US_callGrant('GM_addStyle', [css]);\n` +
+		`const GM_setValue = (key, value) => __US_callGrant('GM_setValue', [key, value]);\n` +
+		`const GM_getValue = (key, defaultValue) => __US_callGrant('GM_getValue', [key, defaultValue]);\n` +
+		`const GM_deleteValue = (key) => __US_callGrant('GM_deleteValue', [key]);\n` +
+		`const GM_listValues = () => __US_callGrant('GM_listValues');\n` +
+		`GM.xmlHttpRequest = (details) => new Promise((resolve, reject) => {\n` +
+		`  GM_xmlhttpRequest({ ...(details || {}), onloadend: resolve, onerror: reject, ontimeout: reject, onabort: reject });\n` +
+		`});\n` +
+		`GM.addStyle = GM_addStyle; GM.setValue = GM_setValue; GM.getValue = GM_getValue; GM.deleteValue = GM_deleteValue; GM.listValues = GM_listValues;\n` +
+		`try {\n`;
+}
+
+function getPageGrantClientPostamble(userscript) {
+	if (!userscript.pageGrantBridge) return "";
+	return `\n} catch (error) { console.error('Userscripts page grant bridge script error:', error); }\n})();`;
 }
 
 function triageJS(userscript) {
@@ -49,16 +266,11 @@ function triageJS(userscript) {
 function injectJS(userscript) {
 	const filename = userscript.scriptObject.filename;
 	const name = userscript.scriptObject.name;
-	const code = `\
-(async () => {
-	try {
-// ===UserScript===start===
-${userscript.code}
-// ===UserScript====end====
-	} catch (error) {
-		console.error(\`${filename.replaceAll("`", "\\`")}\`, error);
-	}
-})(); //# sourceURL=${filename.replace(/[\s"']/g, "-") + usTag}`;
+	const pageGrantPreamble = getPageGrantClientPreamble(userscript);
+	const pageGrantPostamble = getPageGrantClientPostamble(userscript);
+	const code = `${pageGrantPreamble}${userscript.code}${pageGrantPostamble} //# sourceURL=${
+		filename.replace(/\s/g, "-") + usTag
+	}`;
 	let injectInto = userscript.scriptObject["inject-into"];
 	// change scope to content since strict CSP event detected
 	if (injectInto === "auto" && (userscript.fallback || cspFallbackAttempted)) {
@@ -67,13 +279,13 @@ ${userscript.code}
 	}
 	const world = injectInto === "content" ? "content" : "page";
 	if (window.self === window.top) {
-		console.info(`Injecting: ${name} %c(js/${world})`, colors.yellow);
+		console.info(`Injecting: ${name} %c(js/${world})`, "color: #fff600");
 	} else {
 		console.info(
 			`Injecting: ${name} %c(js/${world})%c - %cframe(${label})(${window.location})`,
-			colors.yellow,
-			colors.inherit,
-			colors.blue,
+			"color: #fff600",
+			"color: inherit",
+			"color: #006fff",
 		);
 	}
 	if (world === "page") {
@@ -86,26 +298,26 @@ ${userscript.code}
 		(document.body ?? document.head ?? document.documentElement).append(div);
 	} else {
 		try {
-			Function(
+			// eslint-disable-next-line no-new-func
+			return Function(
 				`{${Object.keys(userscript.apis).join(",")}}`,
 				code,
 			)(userscript.apis);
 		} catch (error) {
-			console.error(`${filename}`, error);
+			console.error(`"${filename}" error:`, error);
 		}
-		return;
 	}
 }
 
 function injectCSS(name, code) {
 	if (window.self === window.top) {
-		console.info(`Injecting ${name} %c(css)`, colors.green);
+		console.info(`Injecting ${name} %c(css)`, "color: #60f36c");
 	} else {
 		console.info(
 			`Injecting ${name} %c(css)%c - %cframe(${label})(${window.location})`,
-			colors.green,
-			colors.inherit,
-			colors.blue,
+			"color: #60f36c",
+			"color: inherit",
+			"color: #006fff",
 		);
 	}
 	// Safari lacks full support for tabs.insertCSS
@@ -151,9 +363,6 @@ async function injection() {
 	const response = await browser.runtime.sendMessage({
 		name: "REQ_USERSCRIPTS",
 	});
-	if (import.meta.env.MODE === "development") {
-		console.debug("REQ_USERSCRIPTS", response);
-	}
 	// cancel injection if errors detected
 	if (!response || response.error) {
 		console.error(response?.error || "REQ_USERSCRIPTS returned undefined");
@@ -182,13 +391,14 @@ async function injection() {
 		userscript.apis.GM_info = userscript.apis.GM.info;
 		// if @grant explicitly set to none, empty grants array
 		if (grants.includes("none")) grants.length = 0;
-		// @grant values exist for page scoped userscript
+		// @grant values exist for page scoped userscript.
+		// Keep the userscript in the page world and expose granted APIs through a
+		// content-world bridge instead of stripping grants. This preserves access to
+		// page globals while privileged APIs still execute in the content script.
 		if (grants.length && injectInto === "page") {
-			// remove grants
-			grants.length = 0;
-			// log warning
-			console.warn(
-				`${filename} @grant values removed due to @inject-into value: ${injectInto} - https://github.com/quoid/userscripts/issues/265#issuecomment-1213462394`,
+			installPageGrantBridge(userscript, grants);
+			console.info(
+				`${filename} @grant values bridged for @inject-into value: ${injectInto}`,
 			);
 		}
 		// @grant exist for auto scoped userscript
@@ -257,7 +467,7 @@ function listeners() {
 			for (let i = 0; i < data.files.menu.length; i++) {
 				const item = data.files.menu[i];
 				if (item.scriptObject.filename === filename) {
-					console.info(`Injecting ${filename} %c(js)`, colors.yellow);
+					console.info(`Injecting ${filename} %c(js)`, "color: #fff600");
 					injectJS(item);
 					return;
 				}
@@ -279,13 +489,9 @@ function listeners() {
 }
 
 async function initialize() {
-	// avoid duplicate injection of content scripts
-	if (window["CS_ENTRY_USERSCRIPTS"]) return;
-	window["CS_ENTRY_USERSCRIPTS"] = 1;
-	// check user settings
-	const key = "US_GLOBAL_ACTIVE";
-	const results = await browser.storage.local.get(key);
-	if (results[key] === false) return console.info("Userscripts off");
+	const results = await browser.storage.local.get("US_GLOBAL_ACTIVE");
+	if (results?.US_GLOBAL_ACTIVE === false)
+		return console.info("Userscripts off");
 	// start the injection process and add the listeners
 	injection();
 	listeners();
