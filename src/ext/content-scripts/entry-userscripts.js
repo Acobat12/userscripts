@@ -1,4 +1,5 @@
 import USAPI from "./api.js";
+import { colors } from "@shared/colors.js";
 
 // code received from background page will be stored in this variable
 // code referenced again when strict CSPs block initial injection attempt
@@ -92,6 +93,14 @@ function installPageGrantBridge(userscript, grants) {
 							handler,
 							response: serializableXhrResponse(response),
 						});
+						if (
+							handler === "onloadend" ||
+							handler === "onabort" ||
+							handler === "onerror" ||
+							handler === "ontimeout"
+						) {
+							xhrControls.delete(id);
+						}
 					};
 				}
 				const control = USAPI.GM_xmlhttpRequest(details);
@@ -100,8 +109,8 @@ function installPageGrantBridge(userscript, grants) {
 			}
 
 			if (method === "GM_addStyle" || method === "addStyle") {
-				const result = USAPI.addStyle(String(args[0] || ""));
-				respond(id, { type: "result", result });
+				USAPI.addStyle(String(args[0] || ""));
+				respond(id, { type: "result", result: undefined });
 				return;
 			}
 
@@ -173,7 +182,7 @@ function getPageGrantClientPreamble(userscript) {
 	const bridge = userscript.pageGrantBridge;
 	if (!bridge) return "";
 	const info = userscript.apis?.GM?.info || userscript.apis?.GM_info || {};
-	return `(() => {\n` +
+	return (
 		`const __US_BRIDGE_ID__ = ${JSON.stringify(bridge.bridgeId)};\n` +
 		`const __US_REQUEST_EVENT__ = ${JSON.stringify(bridge.requestEvent)};\n` +
 		`const __US_RESPONSE_EVENT__ = ${JSON.stringify(bridge.responseEvent)};\n` +
@@ -181,12 +190,13 @@ function getPageGrantClientPreamble(userscript) {
 		`const GM_info = ${JSON.stringify(info)};\n` +
 		`const GM = { info: GM_info };\n` +
 		`const __US_randomId = () => Date.now().toString(36) + '_' + Math.random().toString(36).slice(2);\n` +
+		`const __US_terminalXhrHandlers = new Set(['onloadend','onabort','onerror','ontimeout']);\n` +
 		`const __US_callGrant = (method, args = []) => new Promise((resolve, reject) => {\n` +
 		`  const id = __US_randomId();\n` +
 		`  const onResponse = (event) => {\n` +
 		`    const detail = event.detail || {};\n` +
 		`    if (detail.id !== id) return;\n` +
-		`    if (detail.type === 'result') { document.removeEventListener(__US_RESPONSE_EVENT__, onResponse); resolve(detail.result); }\n` +
+		`    if (detail.type === 'result') { document.removeEventListener(__US_RESPONSE_EVENT__, onResponse); resolve(detail.result); return; }\n` +
 		`    if (detail.type === 'error') { document.removeEventListener(__US_RESPONSE_EVENT__, onResponse); reject(new Error(detail.error || 'Userscripts grant bridge error')); }\n` +
 		`  };\n` +
 		`  document.addEventListener(__US_RESPONSE_EVENT__, onResponse);\n` +
@@ -205,7 +215,7 @@ function getPageGrantClientPreamble(userscript) {
 		`    if (detail.type === 'xhr-event') {\n` +
 		`      const cb = callbacks[detail.handler];\n` +
 		`      if (typeof cb === 'function') cb(detail.response);\n` +
-		`      if (['onloadend','onabort','onerror','ontimeout'].includes(detail.handler)) document.removeEventListener(__US_RESPONSE_EVENT__, onResponse);\n` +
+		`      if (__US_terminalXhrHandlers.has(detail.handler)) document.removeEventListener(__US_RESPONSE_EVENT__, onResponse);\n` +
 		`      return;\n` +
 		`    }\n` +
 		`    if (detail.type === 'error') {\n` +
@@ -215,7 +225,7 @@ function getPageGrantClientPreamble(userscript) {
 		`  };\n` +
 		`  document.addEventListener(__US_RESPONSE_EVENT__, onResponse);\n` +
 		`  document.dispatchEvent(new CustomEvent(__US_REQUEST_EVENT__, { detail: { bridgeId: __US_BRIDGE_ID__, id, method: 'GM_xmlhttpRequest', args: [payload] } }));\n` +
-		`  return { abort() { document.dispatchEvent(new CustomEvent(__US_ABORT_EVENT__, { detail: { bridgeId: __US_BRIDGE_ID__, id } })); } };\n` +
+		`  return { abort() { document.removeEventListener(__US_RESPONSE_EVENT__, onResponse); document.dispatchEvent(new CustomEvent(__US_ABORT_EVENT__, { detail: { bridgeId: __US_BRIDGE_ID__, id } })); } };\n` +
 		`}\n` +
 		`const GM_addStyle = (css) => __US_callGrant('GM_addStyle', [css]);\n` +
 		`const GM_setValue = (key, value) => __US_callGrant('GM_setValue', [key, value]);\n` +
@@ -225,13 +235,13 @@ function getPageGrantClientPreamble(userscript) {
 		`GM.xmlHttpRequest = (details) => new Promise((resolve, reject) => {\n` +
 		`  GM_xmlhttpRequest({ ...(details || {}), onloadend: resolve, onerror: reject, ontimeout: reject, onabort: reject });\n` +
 		`});\n` +
-		`GM.addStyle = GM_addStyle; GM.setValue = GM_setValue; GM.getValue = GM_getValue; GM.deleteValue = GM_deleteValue; GM.listValues = GM_listValues;\n` +
-		`try {\n`;
+		`GM.xmlhttpRequest = GM.xmlHttpRequest;\n` +
+		`GM.addStyle = GM_addStyle; GM.setValue = GM_setValue; GM.getValue = GM_getValue; GM.deleteValue = GM_deleteValue; GM.listValues = GM_listValues;\n`
+	);
 }
 
-function getPageGrantClientPostamble(userscript) {
-	if (!userscript.pageGrantBridge) return "";
-	return `\n} catch (error) { console.error('Userscripts page grant bridge script error:', error); }\n})();`;
+function getPageGrantClientPostamble(_userscript) {
+	return "";
 }
 
 function triageJS(userscript) {
@@ -268,9 +278,18 @@ function injectJS(userscript) {
 	const name = userscript.scriptObject.name;
 	const pageGrantPreamble = getPageGrantClientPreamble(userscript);
 	const pageGrantPostamble = getPageGrantClientPostamble(userscript);
-	const code = `${pageGrantPreamble}${userscript.code}${pageGrantPostamble} //# sourceURL=${
-		filename.replace(/\s/g, "-") + usTag
-	}`;
+	const code = `\
+(async () => {
+	try {
+${pageGrantPreamble}
+// ===UserScript===start===
+${userscript.code}
+// ===UserScript====end====
+${pageGrantPostamble}
+	} catch (error) {
+		console.error(\`${filename.replaceAll("`", "\\`")}\`, error);
+	}
+})(); //# sourceURL=${filename.replace(/[\s"']/g, "-") + usTag}`;
 	let injectInto = userscript.scriptObject["inject-into"];
 	// change scope to content since strict CSP event detected
 	if (injectInto === "auto" && (userscript.fallback || cspFallbackAttempted)) {
@@ -279,13 +298,13 @@ function injectJS(userscript) {
 	}
 	const world = injectInto === "content" ? "content" : "page";
 	if (window.self === window.top) {
-		console.info(`Injecting: ${name} %c(js/${world})`, "color: #fff600");
+		console.info(`Injecting: ${name} %c(js/${world})`, colors.yellow);
 	} else {
 		console.info(
 			`Injecting: ${name} %c(js/${world})%c - %cframe(${label})(${window.location})`,
-			"color: #fff600",
-			"color: inherit",
-			"color: #006fff",
+			colors.yellow,
+			colors.inherit,
+			colors.blue,
 		);
 	}
 	if (world === "page") {
@@ -316,8 +335,8 @@ function injectCSS(name, code) {
 		console.info(
 			`Injecting ${name} %c(css)%c - %cframe(${label})(${window.location})`,
 			"color: #60f36c",
-			"color: inherit",
-			"color: #006fff",
+			colors.inherit,
+			colors.blue,
 		);
 	}
 	// Safari lacks full support for tabs.insertCSS
@@ -467,7 +486,7 @@ function listeners() {
 			for (let i = 0; i < data.files.menu.length; i++) {
 				const item = data.files.menu[i];
 				if (item.scriptObject.filename === filename) {
-					console.info(`Injecting ${filename} %c(js)`, "color: #fff600");
+					console.info(`Injecting ${filename} %c(js)`, colors.yellow);
 					injectJS(item);
 					return;
 				}
