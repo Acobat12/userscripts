@@ -410,23 +410,16 @@ async function injection() {
 		userscript.apis.GM_info = userscript.apis.GM.info;
 		// if @grant explicitly set to none, empty grants array
 		if (grants.includes("none")) grants.length = 0;
-		// @grant values exist for page scoped userscript.
+		// @grant values exist for page/auto scoped userscripts.
 		// Keep the userscript in the page world and expose granted APIs through a
-		// content-world bridge instead of stripping grants. This preserves access to
-		// page globals while privileged APIs still execute in the content script.
-		if (grants.length && injectInto === "page") {
+		// content-world bridge instead of stripping grants or forcing content mode.
+		// This preserves access to page globals while privileged APIs still
+		// execute in the content script. When strict CSP blocks page injection,
+		// the existing fallback path will still retry in content.
+		if (grants.length && (injectInto === "page" || injectInto === "auto")) {
 			installPageGrantBridge(userscript, grants);
 			console.info(
 				`${filename} @grant values bridged for @inject-into value: ${injectInto}`,
-			);
-		}
-		// @grant exist for auto scoped userscript
-		if (grants.length && injectInto === "auto") {
-			// change scope
-			userscript.scriptObject["inject-into"] = "content";
-			// log warning
-			console.warn(
-				`${filename} @inject-into value set to 'content' due to @grant values: ${grants} - https://github.com/quoid/userscripts/issues/265#issuecomment-1213462394`,
 			);
 		}
 		// loop through each userscript @grant value, add methods as needed
