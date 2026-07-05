@@ -23,11 +23,157 @@ function pageGrantBridgeEventName(id, type) {
 	return `__userscripts_page_grant_bridge_${id}_${type}__`;
 }
 
-function serializableXhrResponse(response) {
+const PAGE_BRIDGE_FILENAME_BOUND_METHODS = new Set([
+	"setValue",
+	"getValue",
+	"deleteValue",
+	"listValues",
+]);
+
+const PAGE_BRIDGE_CLIENT_METHOD_NAMES = {
+	addStyle: "GM_addStyle",
+	openInTab: "GM_openInTab",
+	closeTab: "GM_closeTab",
+	getTab: "GM_getTab",
+	saveTab: "GM_saveTab",
+	setClipboard: "GM_setClipboard",
+	setValue: "GM_setValue",
+	getValue: "GM_getValue",
+	deleteValue: "GM_deleteValue",
+	listValues: "GM_listValues",
+};
+
+function normalizePageGrantMethod(method) {
+	if (typeof method !== "string" || !method.length) return "";
+	if (method === "GM_xmlhttpRequest" || method === "xmlHttpRequest") {
+		return "GM_xmlhttpRequest";
+	}
+	if (method.startsWith("GM.")) return method.slice(3);
+	if (method.startsWith("GM_")) return method.slice(3);
+	return method;
+}
+
+function isPageGrantMethodSupported(method) {
+	const normalizedMethod = normalizePageGrantMethod(method);
+	return (
+		normalizedMethod === "GM_xmlhttpRequest" ||
+		Object.prototype.hasOwnProperty.call(USAPI, normalizedMethod)
+	);
+}
+
+async function callPageGrantMethod(method, filename, args = []) {
+	const normalizedMethod = normalizePageGrantMethod(method);
+	if (normalizedMethod === "GM_xmlhttpRequest") {
+		throw new Error("GM_xmlhttpRequest must be handled separately");
+	}
+	if (!Object.prototype.hasOwnProperty.call(USAPI, normalizedMethod)) {
+		throw new Error(`Unsupported bridged grant: ${method}`);
+	}
+	if (PAGE_BRIDGE_FILENAME_BOUND_METHODS.has(normalizedMethod)) {
+		return USAPI[normalizedMethod].bind({ US_filename: filename })(...args);
+	}
+	return USAPI[normalizedMethod](...args);
+}
+
+function getPageGrantClientMethodDefinitions(grants) {
+	const methods = new Set();
+	for (const grant of grants || []) {
+		const normalizedMethod = normalizePageGrantMethod(grant);
+		if (isPageGrantMethodSupported(normalizedMethod)) {
+			methods.add(normalizedMethod);
+		}
+	}
+
+	const wrapperLines = [];
+	const assignmentLines = [];
+	for (const method of methods) {
+		if (method === "GM_xmlhttpRequest") continue;
+		const legacyName = PAGE_BRIDGE_CLIENT_METHOD_NAMES[method];
+		if (!legacyName) continue;
+		wrapperLines.push(
+			`const ${legacyName} = (...args) => __US_callGrant(${JSON.stringify(legacyName)}, args);\n`,
+		);
+		assignmentLines.push(`GM.${method} = ${legacyName};\n`);
+	}
+
+	return {
+		hasXmlHttpRequest: methods.has("GM_xmlhttpRequest"),
+		methodWrapperCode: wrapperLines.join(""),
+		gmAssignmentCode: assignmentLines.join(""),
+	};
+}
+
+function getResponseContentType(response) {
+	if (!response || typeof response !== "object") return "";
+	if (typeof response.contentType === "string" && response.contentType) {
+		return response.contentType;
+	}
+	if (typeof response.responseHeaders !== "string") return "";
+	const match = response.responseHeaders.match(
+		/(?:^|\r?\n)content-type:\s*([^\r\n]+)/i,
+	);
+	return match ? match[1].trim() : "";
+}
+
+async function serializeXhrResponseValue(value, responseType, contentType) {
+	if (value == null) return value;
+	if (
+		typeof value === "string" ||
+		typeof value === "number" ||
+		typeof value === "boolean"
+	) {
+		return value;
+	}
+	if (value instanceof ArrayBuffer) {
+		return {
+			__userscriptsType: "ArrayBuffer",
+			data: Array.from(new Uint8Array(value)),
+		};
+	}
+	if (ArrayBuffer.isView(value)) {
+		return {
+			__userscriptsType: "ArrayBufferView",
+			data: Array.from(new Uint8Array(value.buffer, value.byteOffset, value.byteLength)),
+			view: value.constructor?.name || "Uint8Array",
+		};
+	}
+	if (value instanceof Blob) {
+		return {
+			__userscriptsType: "Blob",
+			data: Array.from(new Uint8Array(await value.arrayBuffer())),
+			mimeType: value.type || contentType || "",
+		};
+	}
+	if (value instanceof Document) {
+		let serialized = "";
+		try {
+			serialized = new XMLSerializer().serializeToString(value);
+		} catch {
+			serialized = value.documentElement?.outerHTML || "";
+		}
+		return {
+			__userscriptsType: "Document",
+			data: serialized,
+			mimeType: value.contentType || contentType || "text/html",
+		};
+	}
+	if (responseType === "json") {
+		try {
+			return JSON.parse(JSON.stringify(value));
+		} catch {
+			return null;
+		}
+	}
+	return value;
+}
+
+async function serializableXhrResponse(response) {
 	if (!response || typeof response !== "object") return response;
 	const result = {};
+	const contentType = getResponseContentType(response);
 	for (const key of [
 		"readyState",
+		"contentType",
 		"responseHeaders",
 		"responseText",
 		"responseType",
@@ -36,20 +182,18 @@ function serializableXhrResponse(response) {
 		"status",
 		"statusText",
 	]) {
+		if (key === "contentType") {
+			if (contentType) result.contentType = contentType;
+			continue;
+		}
 		if (key in response) result[key] = response[key];
 	}
 	if ("response" in response) {
-		const value = response.response;
-		if (
-			typeof value === "string" ||
-			typeof value === "number" ||
-			typeof value === "boolean" ||
-			value == null
-		) {
-			result.response = value;
-		} else {
-			result.response = response.responseText ?? undefined;
-		}
+		result.response = await serializeXhrResponseValue(
+			response.response,
+			response.responseType,
+			contentType,
+		);
 	}
 	return result;
 }
@@ -75,7 +219,7 @@ function installPageGrantBridge(userscript, grants) {
 		if (!detail || detail.bridgeId !== bridgeId || !detail.id) return;
 		const { id, method, args = [] } = detail;
 		try {
-			if (method === "GM_xmlhttpRequest") {
+			if (normalizePageGrantMethod(method) === "GM_xmlhttpRequest") {
 				const details = { ...(args[0] || {}) };
 				for (const handler of [
 					"onreadystatechange",
@@ -87,11 +231,11 @@ function installPageGrantBridge(userscript, grants) {
 					"ontimeout",
 					"onloadend",
 				]) {
-					details[handler] = (response) => {
+					details[handler] = async (response) => {
 						respond(id, {
 							type: "xhr-event",
 							handler,
-							response: serializableXhrResponse(response),
+							response: await serializableXhrResponse(response),
 						});
 						if (
 							handler === "onloadend" ||
@@ -107,49 +251,8 @@ function installPageGrantBridge(userscript, grants) {
 				xhrControls.set(id, control);
 				return;
 			}
-
-			if (method === "GM_addStyle" || method === "addStyle") {
-				USAPI.addStyle(String(args[0] || ""));
-				respond(id, { type: "result", result: undefined });
-				return;
-			}
-
-			if (method === "GM_setValue" || method === "setValue") {
-				const result = await USAPI.setValue.bind({ US_filename: filename })(
-					args[0],
-					args[1],
-				);
-				respond(id, { type: "result", result });
-				return;
-			}
-
-			if (method === "GM_getValue" || method === "getValue") {
-				const result = await USAPI.getValue.bind({ US_filename: filename })(
-					args[0],
-					args[1],
-				);
-				respond(id, { type: "result", result });
-				return;
-			}
-
-			if (method === "GM_deleteValue" || method === "deleteValue") {
-				const result = await USAPI.deleteValue.bind({ US_filename: filename })(
-					args[0],
-				);
-				respond(id, { type: "result", result });
-				return;
-			}
-
-			if (method === "GM_listValues" || method === "listValues") {
-				const result = await USAPI.listValues.bind({ US_filename: filename })();
-				respond(id, { type: "result", result });
-				return;
-			}
-
-			respond(id, {
-				type: "error",
-				error: `Unsupported bridged grant: ${method}`,
-			});
+			const result = await callPageGrantMethod(method, filename, args);
+			respond(id, { type: "result", result });
 		} catch (error) {
 			respond(id, {
 				type: "error",
@@ -182,6 +285,8 @@ function getPageGrantClientPreamble(userscript) {
 	const bridge = userscript.pageGrantBridge;
 	if (!bridge) return "";
 	const info = userscript.apis?.GM?.info || userscript.apis?.GM_info || {};
+	const { hasXmlHttpRequest, methodWrapperCode, gmAssignmentCode } =
+		getPageGrantClientMethodDefinitions(bridge.grants);
 	return (
 		`const __US_BRIDGE_ID__ = ${JSON.stringify(bridge.bridgeId)};\n` +
 		`const __US_REQUEST_EVENT__ = ${JSON.stringify(bridge.requestEvent)};\n` +
@@ -191,6 +296,42 @@ function getPageGrantClientPreamble(userscript) {
 		`const GM = { info: GM_info };\n` +
 		`const __US_randomId = () => Date.now().toString(36) + '_' + Math.random().toString(36).slice(2);\n` +
 		`const __US_terminalXhrHandlers = new Set(['onloadend','onabort','onerror','ontimeout']);\n` +
+		`const __US_parseHeaders = (raw) => {\n` +
+		`  const headers = {};\n` +
+		`  if (typeof raw !== 'string' || !raw) return headers;\n` +
+		`  for (const line of raw.split(/\\r?\\n/)) {\n` +
+		`    const match = /^([\\w-]+):\\s*(.+)$/.exec(line);\n` +
+		`    if (match) headers[match[1].toLowerCase()] = match[2];\n` +
+		`  }\n` +
+		`  return headers;\n` +
+		`};\n` +
+		`const __US_restoreXhrValue = (value, responseType, responseHeaders, contentType) => {\n` +
+		`  if (!value || typeof value !== 'object' || !value.__userscriptsType) return value;\n` +
+		`  const mimeType = contentType || (__US_parseHeaders(responseHeaders)['content-type'] || '');\n` +
+		`  if (value.__userscriptsType === 'ArrayBuffer') return new Uint8Array(value.data || []).buffer;\n` +
+		`  if (value.__userscriptsType === 'ArrayBufferView') return new Uint8Array(value.data || []);\n` +
+		`  if (value.__userscriptsType === 'Blob') return new Blob([new Uint8Array(value.data || [])], { type: value.mimeType || mimeType || '' });\n` +
+		`  if (value.__userscriptsType === 'Document') {\n` +
+		`    const parser = new DOMParser();\n` +
+		`    const type = (value.mimeType || mimeType || '').includes('html') ? 'text/html' : 'text/xml';\n` +
+		`    return parser.parseFromString(String(value.data || ''), type);\n` +
+		`  }\n` +
+		`  return value;\n` +
+		`};\n` +
+		`const __US_restoreXhrResponse = (response) => {\n` +
+		`  if (!response || typeof response !== 'object') return response;\n` +
+		`  const restored = { ...response };\n` +
+		`  restored.getAllResponseHeaders = () => String(restored.responseHeaders || '');\n` +
+		`  restored.getResponseHeader = (name) => __US_parseHeaders(restored.responseHeaders || '')[String(name || '').toLowerCase()] || null;\n` +
+		`  restored.response = __US_restoreXhrValue(restored.response, restored.responseType, restored.responseHeaders, restored.contentType);\n` +
+		`  if ((restored.responseType === '' || restored.responseType === 'text') && typeof restored.response === 'string') {\n` +
+		`    restored.responseText = restored.response;\n` +
+		`  }\n` +
+		`  if (restored.responseType === 'document' && restored.response instanceof Document) {\n` +
+		`    restored.responseXML = restored.response;\n` +
+		`  }\n` +
+		`  return restored;\n` +
+		`};\n` +
 		`const __US_callGrant = (method, args = []) => new Promise((resolve, reject) => {\n` +
 		`  const id = __US_randomId();\n` +
 		`  const onResponse = (event) => {\n` +
@@ -202,41 +343,39 @@ function getPageGrantClientPreamble(userscript) {
 		`  document.addEventListener(__US_RESPONSE_EVENT__, onResponse);\n` +
 		`  document.dispatchEvent(new CustomEvent(__US_REQUEST_EVENT__, { detail: { bridgeId: __US_BRIDGE_ID__, id, method, args } }));\n` +
 		`});\n` +
-		`function GM_xmlhttpRequest(details) {\n` +
-		`  const id = __US_randomId();\n` +
-		`  const callbacks = {};\n` +
-		`  const payload = { ...(details || {}) };\n` +
-		`  for (const key of ['onreadystatechange','onloadstart','onprogress','onabort','onerror','onload','ontimeout','onloadend']) {\n` +
-		`    if (typeof payload[key] === 'function') { callbacks[key] = payload[key]; delete payload[key]; }\n` +
-		`  }\n` +
-		`  const onResponse = (event) => {\n` +
-		`    const detail = event.detail || {};\n` +
-		`    if (detail.id !== id) return;\n` +
-		`    if (detail.type === 'xhr-event') {\n` +
-		`      const cb = callbacks[detail.handler];\n` +
-		`      if (typeof cb === 'function') cb(detail.response);\n` +
-		`      if (__US_terminalXhrHandlers.has(detail.handler)) document.removeEventListener(__US_RESPONSE_EVENT__, onResponse);\n` +
-		`      return;\n` +
-		`    }\n` +
-		`    if (detail.type === 'error') {\n` +
-		`      document.removeEventListener(__US_RESPONSE_EVENT__, onResponse);\n` +
-		`      if (typeof callbacks.onerror === 'function') callbacks.onerror({ error: detail.error });\n` +
-		`    }\n` +
-		`  };\n` +
-		`  document.addEventListener(__US_RESPONSE_EVENT__, onResponse);\n` +
-		`  document.dispatchEvent(new CustomEvent(__US_REQUEST_EVENT__, { detail: { bridgeId: __US_BRIDGE_ID__, id, method: 'GM_xmlhttpRequest', args: [payload] } }));\n` +
-		`  return { abort() { document.removeEventListener(__US_RESPONSE_EVENT__, onResponse); document.dispatchEvent(new CustomEvent(__US_ABORT_EVENT__, { detail: { bridgeId: __US_BRIDGE_ID__, id } })); } };\n` +
-		`}\n` +
-		`const GM_addStyle = (css) => __US_callGrant('GM_addStyle', [css]);\n` +
-		`const GM_setValue = (key, value) => __US_callGrant('GM_setValue', [key, value]);\n` +
-		`const GM_getValue = (key, defaultValue) => __US_callGrant('GM_getValue', [key, defaultValue]);\n` +
-		`const GM_deleteValue = (key) => __US_callGrant('GM_deleteValue', [key]);\n` +
-		`const GM_listValues = () => __US_callGrant('GM_listValues');\n` +
-		`GM.xmlHttpRequest = (details) => new Promise((resolve, reject) => {\n` +
-		`  GM_xmlhttpRequest({ ...(details || {}), onloadend: resolve, onerror: reject, ontimeout: reject, onabort: reject });\n` +
-		`});\n` +
-		`GM.xmlhttpRequest = GM.xmlHttpRequest;\n` +
-		`GM.addStyle = GM_addStyle; GM.setValue = GM_setValue; GM.getValue = GM_getValue; GM.deleteValue = GM_deleteValue; GM.listValues = GM_listValues;\n`
+		(hasXmlHttpRequest
+			? `function GM_xmlhttpRequest(details) {\n` +
+				`  const id = __US_randomId();\n` +
+				`  const callbacks = {};\n` +
+				`  const payload = { ...(details || {}) };\n` +
+				`  for (const key of ['onreadystatechange','onloadstart','onprogress','onabort','onerror','onload','ontimeout','onloadend']) {\n` +
+				`    if (typeof payload[key] === 'function') { callbacks[key] = payload[key]; delete payload[key]; }\n` +
+				`  }\n` +
+				`  const onResponse = (event) => {\n` +
+				`    const detail = event.detail || {};\n` +
+				`    if (detail.id !== id) return;\n` +
+				`    if (detail.type === 'xhr-event') {\n` +
+				`      const cb = callbacks[detail.handler];\n` +
+				`      if (typeof cb === 'function') cb(__US_restoreXhrResponse(detail.response));\n` +
+				`      if (__US_terminalXhrHandlers.has(detail.handler)) document.removeEventListener(__US_RESPONSE_EVENT__, onResponse);\n` +
+				`      return;\n` +
+				`    }\n` +
+				`    if (detail.type === 'error') {\n` +
+				`      document.removeEventListener(__US_RESPONSE_EVENT__, onResponse);\n` +
+				`      if (typeof callbacks.onerror === 'function') callbacks.onerror({ error: detail.error });\n` +
+				`    }\n` +
+				`  };\n` +
+				`  document.addEventListener(__US_RESPONSE_EVENT__, onResponse);\n` +
+				`  document.dispatchEvent(new CustomEvent(__US_REQUEST_EVENT__, { detail: { bridgeId: __US_BRIDGE_ID__, id, method: 'GM_xmlhttpRequest', args: [payload] } }));\n` +
+				`  return { abort() { document.removeEventListener(__US_RESPONSE_EVENT__, onResponse); document.dispatchEvent(new CustomEvent(__US_ABORT_EVENT__, { detail: { bridgeId: __US_BRIDGE_ID__, id } })); } };\n` +
+				`}\n` +
+				`GM.xmlHttpRequest = (details) => new Promise((resolve, reject) => {\n` +
+				`  GM_xmlhttpRequest({ ...(details || {}), onloadend: resolve, onerror: reject, ontimeout: reject, onabort: reject });\n` +
+				`});\n` +
+				`GM.xmlhttpRequest = GM.xmlHttpRequest;\n`
+			: "") +
+		methodWrapperCode +
+		gmAssignmentCode
 	);
 }
 
