@@ -482,10 +482,10 @@ function getPageGrantClientPreamble(userscript) {
 		`const __US_ABORT_EVENT__ = ${JSON.stringify(bridge.abortEvent)};\n` +
 		`const GM_info = ${JSON.stringify(info)};\n` +
 		`const GM = { info: GM_info };\n` +
-		`${__US_getTypedArrayConstructor.toString()}\n` +
-		`${__US_restoreTypedArrayView.toString()}\n` +
-		`${__US_serializeBridgeRequestData.toString()}\n` +
-		`${__US_restoreBridgeRequestData.toString()}\n` +
+		`const __US_getTypedArrayConstructor = ${__US_getTypedArrayConstructor.toString()};\n` +
+		`const __US_restoreTypedArrayView = ${__US_restoreTypedArrayView.toString()};\n` +
+		`const __US_serializeBridgeRequestData = ${__US_serializeBridgeRequestData.toString()};\n` +
+		`const __US_restoreBridgeRequestData = ${__US_restoreBridgeRequestData.toString()};\n` +
 		`const __US_randomId = () => Date.now().toString(36) + '_' + Math.random().toString(36).slice(2);\n` +
 		`const __US_terminalXhrHandlers = new Set(['onloadend','onabort','onerror','ontimeout']);\n` +
 		`const __US_parseHeaders = (raw) => {\n` +
