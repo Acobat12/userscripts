@@ -1,186 +1,6 @@
-import { openExtensionPage } from "../shared/utils.js";
-import * as settingsStorage from "../shared/settings.js";
-import { connectNative, sendNativeMessage } from "../shared/native.js";
-
-const FORBIDDEN_HEADER_RULE_BASE_ID = 910000;
-const dnrAppliedSignatures = new Map();
-let dnrRuleUpdateQueue = Promise.resolve();
-
-function normalizeHeaderName(name) {
-	return String(name || "").trim();
-}
-
-function hasDnr() {
-	return Boolean(browser?.declarativeNetRequest?.updateSessionRules);
-}
-
-function updateSessionRulesCompat(args) {
-	const dnr = browser?.declarativeNetRequest;
-	const updateSessionRules = dnr?.updateSessionRules;
-	if (typeof updateSessionRules !== "function") {
-		return Promise.resolve();
-	}
-	try {
-		const maybe = updateSessionRules({
-			addRules: args.addRules || [],
-			removeRuleIds: args.removeRuleIds || [],
-		});
-		if (maybe && typeof maybe.then === "function") {
-			return maybe;
-		}
-	} catch {
-		// fall through to callback style
-	}
-	return new Promise((resolve, reject) => {
-		try {
-			updateSessionRules(
-				{
-					addRules: args.addRules || [],
-					removeRuleIds: args.removeRuleIds || [],
-				},
-				() => {
-					const err = browser.runtime?.lastError?.message;
-					if (err) reject(new Error(err));
-					else resolve();
-				},
-			);
-		} catch (error) {
-			reject(error);
-		}
-	});
-}
-
-function signatureFromDnrRequestHeaders(requestHeaders) {
-	const entries = requestHeaders
-		.map((header) => [
-			`${normalizeHeaderName(String(header.header)).toLowerCase()}:${String(header.operation)}`,
-			String("value" in header ? header.value : ""),
-		])
-		.sort((a, b) => a[0].localeCompare(b[0]));
-	return JSON.stringify(entries);
-}
-
-function queueDnrRuleUpdate(ruleId, signature, rule) {
-	if (signature === dnrAppliedSignatures.get(ruleId)) {
-		return Promise.resolve();
-	}
-
-	dnrRuleUpdateQueue = dnrRuleUpdateQueue
-		.catch(() => undefined)
-		.then(async () => {
-			if (signature === dnrAppliedSignatures.get(ruleId)) return;
-			await updateSessionRulesCompat({
-				removeRuleIds: [ruleId],
-				addRules: [rule],
-			});
-			dnrAppliedSignatures.set(ruleId, signature);
-		});
-
-	return dnrRuleUpdateQueue;
-}
-
-function hashStringToInt(value) {
-	let hash = 0;
-	for (let i = 0; i < value.length; i++) {
-		hash = (hash * 31 + value.charCodeAt(i)) | 0;
-	}
-	return Math.abs(hash);
-}
-
-function makeForbiddenHeaderRuleId(url) {
-	return FORBIDDEN_HEADER_RULE_BASE_ID + (hashStringToInt(url) % 8000) + 1;
-}
-
-function isVotYandexApiUrl(url) {
-	try {
-		const parsed = new URL(url);
-		return (
-			parsed.protocol === "https:" &&
-			String(parsed.hostname || "").toLowerCase() === "api.browser.yandex.ru"
-		);
-	} catch {
-		return false;
-	}
-}
-
-function shouldDebugVotTransport(url) {
-	return isVotYandexApiUrl(url);
-}
-
-function isForbiddenToSetViaXhr(headerName) {
-	const name = normalizeHeaderName(headerName).toLowerCase();
-	if (!name) return false;
-	if (name.startsWith("sec-")) return true;
-	if (name.startsWith("proxy-")) return true;
-	if (name === "user-agent") return true;
-	if (name === "origin") return true;
-	if (name === "referer") return true;
-	return false;
-}
-
-function buildForbiddenHeadersForDnr(headers) {
-	const result = {};
-	const requestedForbiddenHeaderNames = new Set(
-		Object.keys(headers || {}).map((key) => normalizeHeaderName(key).toLowerCase()),
-	);
-	for (const [key, value] of Object.entries(headers || {})) {
-		const normalized = normalizeHeaderName(key);
-		if (!normalized) continue;
-		result[normalized] = String(value);
-	}
-	return { headersToSet: result, requestedForbiddenHeaderNames };
-}
-
-async function ensureForbiddenHeaderRule(url, forbiddenHeaders) {
-	if (!hasDnr()) return;
-	if (!forbiddenHeaders || !Object.keys(forbiddenHeaders).length) return;
-
-	let parsedUrl;
-	try {
-		parsedUrl = new URL(url);
-	} catch {
-		return;
-	}
-
-	const { headersToSet, requestedForbiddenHeaderNames } =
-		buildForbiddenHeadersForDnr(forbiddenHeaders);
-	const requestHeaders = [];
-
-	if (!requestedForbiddenHeaderNames.has("origin")) {
-		requestHeaders.push({ header: "Origin", operation: "remove" });
-	}
-	if (!requestedForbiddenHeaderNames.has("referer")) {
-		requestHeaders.push({ header: "Referer", operation: "remove" });
-	}
-	for (const [header, value] of Object.entries(headersToSet)) {
-		requestHeaders.push({
-			header: normalizeHeaderName(header),
-			operation: "set",
-			value: String(value),
-		});
-	}
-
-	if (!requestHeaders.length) return;
-
-	const signature = signatureFromDnrRequestHeaders(requestHeaders);
-	const ruleId = makeForbiddenHeaderRuleId(
-		`${parsedUrl.origin}${parsedUrl.pathname}`,
-	);
-	const rule = {
-		id: ruleId,
-		priority: 1,
-		action: {
-			type: "modifyHeaders",
-			requestHeaders,
-		},
-		condition: {
-			urlFilter: `|${parsedUrl.origin}${parsedUrl.pathname}`,
-			resourceTypes: ["xmlhttprequest"],
-		},
-	};
-
-	await queueDnrRuleUpdate(ruleId, signature, rule);
-}
+import { contentScriptRegistration, openExtensionPage } from "@ext/utils.js";
+import * as settingsStorage from "@ext/settings.js";
+import { connectNative, sendNativeMessage } from "@ext/native.js";
 
 // first sorts files by run-at value, then by weight value
 function userscriptSort(a, b) {
@@ -241,29 +61,18 @@ function setClipboard(data, type = "text/plain") {
 }
 
 async function setBadgeCount() {
-	const clearBadge = () => {
-		if (import.meta.env.SAFARI_VERSION < 16.4) {
-			browser.browserAction.setBadgeText({ text: "" });
-		} else {
-			browser.browserAction.setBadgeText({ text: null });
-		}
-	};
+	const clearBadge = () => browser.browserAction.setBadgeText({ text: null });
 	// @todo until better introduce in ios, only set badge on macOS
-	const platform = await getPlatform();
 	// set a text badge or an empty string in visionOS will cause the extension's icon to no longer be displayed
-	// set it to null to fix already affected users
-	if (platform === "visionos") {
-		browser.browserAction.setBadgeText({ text: null });
-		return;
-	}
+	const platform = await getPlatform();
 	if (platform !== "macos") return clearBadge();
 	// @todo settingsStorage.get("global_exclude_match")
 	const settings = await settingsStorage.get([
 		"global_active",
 		"toolbar_badge_count",
 	]);
-	if (settings.global_active === false) return clearBadge();
-	if (settings.toolbar_badge_count === false) return clearBadge();
+	if (settings["global_active"] === false) return clearBadge();
+	if (settings["toolbar_badge_count"] === false) return clearBadge();
 
 	const currentTab = await browser.tabs.getCurrent();
 	// no active tabs exist (user closed all windows)
@@ -304,71 +113,82 @@ async function setBadgeCount() {
 	}
 }
 
-// on startup get declarativeNetRequests
-// and set the requests for the session
+// on startup set declarativeNetRequest rulesets
 // should also check and refresh when:
 // 1. dnr item save event in the page occurs
 // 2. dnr item toggle event in the page occurs
 // 3. external editor changes script file content
-async function setSessionRules() {
+async function setDNRRulesets() {
 	// not supported below safari 15.4
-	if (!browser.declarativeNetRequest.updateSessionRules) return;
-	await clearAllSessionRules();
+	if (!browser.declarativeNetRequest.updateDynamicRules) return;
 	const message = { name: "REQ_REQUESTS" };
 	const response = await sendNativeMessage(message);
 	if (response.error) {
 		console.error(response.error);
 		return;
 	}
-	// there are no rules to apply
-	if (!response.length) return;
 	// loop through response, parse the rules, push to array and log
-	const rules = [];
+	/** @type {import("webextension-polyfill").DeclarativeNetRequest.Rule[]} */
+	const addRules = [];
+	let ruleId = 1;
 	for (let i = 0; i < response.length; i++) {
-		const rule = response[i];
-		const code = JSON.parse(rule.code);
-		// check if an array or single rule
-		if (Array.isArray(code)) {
-			code.forEach((r) => rules.push(r));
-			console.info(`Setting session rule: ${rule.name} (${code.length})`);
-		} else {
-			rules.push(code);
-			console.info(`Setting session rule: ${rule.name}`);
+		if (
+			ruleId >
+			browser.declarativeNetRequest.MAX_NUMBER_OF_DYNAMIC_AND_SESSION_RULES
+		) {
+			console.warn(
+				"Rules exceed the maximum number, some rules will be ignored",
+			);
+			break;
+		}
+		const ruleset = response[i];
+		/** @type {Array} */
+		let rules;
+		try {
+			const res = JSON.parse(ruleset.code);
+			// check if an array or single rule
+			if (Array.isArray(res)) {
+				rules = res;
+			} else if (typeof res === "object") {
+				rules = [res];
+			} else {
+				console.warn(`Not a valid DNR ruleset: ${ruleset.name}`);
+				continue;
+			}
+			console.info(`Setting DNR ruleset: ${ruleset.name} (${rules.length})`);
+		} catch (error) {
+			console.warn(
+				`Failed parsed into a valid DNR ruleset: ${ruleset.name}`,
+				error,
+			);
+			continue;
+		}
+		for (const rule of rules) {
+			// simple check if it is a rule object
+			if (!rule.action || !rule.condition || !rule.id) {
+				console.warn("Not a valid DNR rule:", rule);
+				continue;
+			}
+			// set unique ids for all rules to ensure no repeats
+			rule.id = ruleId++;
+			addRules.push(rule);
 		}
 	}
-	// generate unique ids for all rules to ensure no repeats
-	const ids = randomNumberSet(1000, rules.length);
-	rules.map((rule, index) => (rule.id = ids[index]));
+	// remove all then add declarativeNetRequest rules
 	try {
-		await browser.declarativeNetRequest.updateSessionRules({ addRules: rules });
+		const oldRules = await browser.declarativeNetRequest.getDynamicRules();
+		const removeRuleIds = oldRules.map((rule) => rule.id);
+		await browser.declarativeNetRequest.updateDynamicRules({
+			addRules,
+			removeRuleIds,
+		});
 	} catch (error) {
-		console.error(`Error setting session rules: ${error}`);
-		return;
+		return console.error(error);
 	}
-	console.info(`Finished setting ${rules.length} session rules`);
+	console.info(`Finished setting ${addRules.length} DNR rules`);
 }
 
-async function clearAllSessionRules() {
-	const rules = await browser.declarativeNetRequest.getSessionRules();
-	if (!rules.length) return;
-	console.info(`Clearing ${rules.length} session rules`);
-	const ruleIds = rules.map((a) => a.id);
-	await browser.declarativeNetRequest.updateSessionRules({
-		removeRuleIds: ruleIds,
-	});
-}
-
-function randomNumberSet(max, count) {
-	// generates a set of random unique numbers
-	// returns an array
-	const numbers = new Set();
-	while (numbers.size < count) {
-		numbers.add(Math.floor(Math.random() * (max - 1 + 1)) + 1);
-	}
-	return [...numbers];
-}
-
-// the current update logic is similar to setSessionRules()
+// the current update logic is similar to setDNRRulesets()
 // this feature needs a more detailed redesign in the future
 // https://github.com/quoid/userscripts/issues/453
 async function getContextMenuItems() {
@@ -401,32 +221,7 @@ async function getContextMenuItems() {
 }
 
 async function addContextMenuItem(userscript) {
-	// context-menu items persist for a session
-	// to avoid duplication, when created, save the filename to session storage
-	const savedItems = sessionStorage.getItem("menu");
-	// if the session storage key doesn't exist use empty array
-	const activeItems = savedItems ? JSON.parse(savedItems) : [];
-	if (activeItems.indexOf(userscript.scriptObject.filename) !== -1) {
-		// if already saved, remove it, to get fresh code changes
-		await browser.menus.remove(userscript.scriptObject.filename);
-	}
-	// potential bug? https://developer.apple.com/forums/thread/685273
-	// https://stackoverflow.com/q/68431201
-	// parse through match values and change pathnames to deal with bug
 	const patterns = userscript.scriptObject.matches;
-	patterns.forEach((pattern, index) => {
-		try {
-			const url = new URL(pattern);
-			let pathname = url.pathname;
-			if (pathname.length > 1 && pathname.endsWith("/")) {
-				pathname = pathname.slice(0, -1);
-			}
-			patterns[index] = `${url.protocol}//${url.hostname}${pathname}`;
-		} catch (error) {
-			// prevent breaking when non-url pattern present
-		}
-	});
-
 	browser.menus.create(
 		{
 			contexts: ["all"],
@@ -439,9 +234,6 @@ async function addContextMenuItem(userscript) {
 			if (!browser.menus.onClicked.hasListener(contextClick)) {
 				browser.menus.onClicked.addListener(contextClick);
 			}
-			// save the context-menu item reference to sessionStorage
-			const value = JSON.stringify([userscript.scriptObject.filename]);
-			sessionStorage.setItem("menu", value);
 		},
 	);
 }
@@ -578,15 +370,7 @@ async function handleMessage(message, sender) {
 				});
 				// receive messages from content script and process them
 				port.onMessage.addListener((msg) => {
-					if (msg.name === "ABORT") {
-						if (shouldDebugVotTransport(message.details?.url)) {
-							console.log("[Userscripts][VOT][xhr] received ABORT", {
-								url: message.details?.url,
-								method: message.details?.method || "GET",
-							});
-						}
-						xhr.abort();
-					}
+					if (msg.name === "ABORT") xhr.abort();
 					if (msg.name === "DISCONNECT") port.disconnect();
 				});
 				// handle port disconnect and clean tasks
@@ -753,122 +537,12 @@ async function handleMessage(message, sender) {
 				if (details.overrideMimeType) {
 					xhr.overrideMimeType(details.overrideMimeType);
 				}
-				const allHeaders =
-					typeof details.headers === "object" && details.headers
-						? details.headers
-						: {};
-				const headers = {};
-				const forbiddenHeaders = {};
-				for (const [key, value] of Object.entries(allHeaders)) {
-					if (isForbiddenToSetViaXhr(key)) forbiddenHeaders[key] = value;
-					else headers[key] = value;
-				}
-				if (shouldDebugVotTransport(url)) {
-					console.log("[Userscripts][VOT][xhr] start", {
-						url,
-						method,
-						responseType: details.responseType,
-						timeout: details.timeout,
-						headers,
-						forbiddenHeaders,
-					});
-				}
-				xhr.onabort = () => {
-					if (shouldDebugVotTransport(url)) {
-						console.log("[Userscripts][VOT][xhr] onabort", {
-							url,
-							method,
-							readyState: xhr.readyState,
-							status: xhr.status,
-							statusText: xhr.statusText,
-						});
-					}
-				};
-				xhr.onerror = () => {
-					if (shouldDebugVotTransport(url)) {
-						console.log("[Userscripts][VOT][xhr] onerror", {
-							url,
-							method,
-							readyState: xhr.readyState,
-							status: xhr.status,
-							statusText: xhr.statusText,
-						});
-					}
-				};
-				xhr.ontimeout = () => {
-					if (shouldDebugVotTransport(url)) {
-						console.log("[Userscripts][VOT][xhr] ontimeout", {
-							url,
-							method,
-							readyState: xhr.readyState,
-							status: xhr.status,
-							statusText: xhr.statusText,
-						});
-					}
-				};
-				xhr.onloadstart = () => {
-					if (shouldDebugVotTransport(url)) {
-						console.log("[Userscripts][VOT][xhr] onloadstart", {
-							url,
-							method,
-							readyState: xhr.readyState,
-						});
-					}
-				};
-				xhr.onloadend = () => {
-					if (shouldDebugVotTransport(url)) {
-						console.log("[Userscripts][VOT][xhr] onloadend", {
-							url,
-							method,
-							readyState: xhr.readyState,
-							status: xhr.status,
-							statusText: xhr.statusText,
-							responseURL: xhr.responseURL,
-							responseHeaders: xhr.readyState >= xhr.HEADERS_RECEIVED
-								? xhr.getAllResponseHeaders()
-								: "",
-						});
-					}
-				};
 				xhr.open(method, url, true, user, password);
-				try {
-					await ensureForbiddenHeaderRule(url, forbiddenHeaders);
-					if (shouldDebugVotTransport(url)) {
-						console.log("[Userscripts][VOT][xhr] forbidden-header DNR ready", {
-							url,
-							method,
-							forbiddenHeaderNames: Object.keys(forbiddenHeaders),
-						});
-					}
-				} catch (error) {
-					console.warn(
-						"[Userscripts][VOT] Failed to apply forbidden-header rule; direct transport may break:",
-						error,
-					);
-				}
 				// must set headers after `xhr.open()`, but before `xhr.send()`
-				if (typeof headers === "object") {
-					for (const [key, val] of Object.entries(headers)) {
+				if (typeof details.headers === "object") {
+					for (const [key, val] of Object.entries(details.headers)) {
 						xhr.setRequestHeader(key, val);
 					}
-				}
-				if (shouldDebugVotTransport(url)) {
-					console.log("[Userscripts][VOT][xhr] send", {
-						url,
-						method,
-						headerNames: Object.keys(headers),
-						forbiddenHeaderNames: Object.keys(forbiddenHeaders),
-						bodyKind:
-							body == null
-								? "empty"
-								: body instanceof Uint8Array
-									? "Uint8Array"
-									: body instanceof FormData
-										? "FormData"
-										: body instanceof URLSearchParams
-											? "URLSearchParams"
-											: typeof body,
-					});
 				}
 				xhr.send(body);
 			} catch (error) {
@@ -876,21 +550,30 @@ async function handleMessage(message, sender) {
 			}
 			return { status: "fulfilled" };
 		}
-		case "REFRESH_SESSION_RULES": {
-			setSessionRules();
+		case "REFRESH_DNR_RULES": {
+			setDNRRulesets();
 			break;
 		}
 		case "REFRESH_CONTEXT_MENU_SCRIPTS": {
 			getContextMenuItems();
 			break;
 		}
+		case "WEB_USERJS_POPUP": {
+			const currentTab = await browser.tabs.getCurrent();
+			if (currentTab.id === sender.tab.id) {
+				browser.browserAction.openPopup();
+			}
+			break;
+		}
 	}
 }
 browser.runtime.onInstalled.addListener(async () => {
-	nativeChecks();
+	await nativeChecks();
+	const enable = await settingsStorage.get("augmented_userjs_install");
+	await contentScriptRegistration(enable);
 });
 browser.runtime.onStartup.addListener(async () => {
-	setSessionRules();
+	setDNRRulesets();
 	getContextMenuItems();
 });
 // listens for messages from content script, popup and page
@@ -904,17 +587,17 @@ browser.windows.onFocusChanged.addListener(async (windowId) => {
 	}
 	nativeChecks();
 	setBadgeCount();
-	setSessionRules();
+	setDNRRulesets();
 	getContextMenuItems();
 });
 browser.webNavigation.onCompleted.addListener(setBadgeCount);
 
 // handle native app messages
 const port = connectNative();
-port.onMessage.addListener((message) => {
+port.onMessage.addListener(async (message) => {
 	// console.info(message); // DEBUG
 	if (message.name === "SAVE_LOCATION_CHANGED") {
-		openExtensionPage();
+		await openExtensionPage();
 		if (message?.userInfo?.returnApp === true) {
 			sendNativeMessage({ name: "OPEN_APP" });
 		}
