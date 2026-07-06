@@ -1,0 +1,65 @@
+name: Userscripts-Debug-macOS-Intel
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: |
+          if ! git describe --tags --abbrev=0 >/dev/null 2>&1; then
+            git tag v4.8.6
+          fi
+
+      - run: npm run build:mac-safari-15
+
+      - run: |
+          xcodebuild \
+            -project xcode/Userscripts.xcodeproj \
+            -scheme Mac \
+            -configuration Debug \
+            -derivedDataPath build \
+            -destination 'platform=macOS,arch=x86_64' \
+            ARCHS=x86_64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGNING_REQUIRED=YES \
+            CODE_SIGN_IDENTITY="-" \
+            clean build
+
+      - run: |
+            cd build/Build/Products/Debug
+
+            find Userscripts-Debug.app -name "*.framework" -exec \
+            codesign --force --sign - {} \;
+
+            find Userscripts-Debug.app -name "*.appex" -exec \
+            codesign --force --sign - {} \;
+
+            codesign --force --sign - Userscripts-Debug.app
+
+            codesign --verify --deep --strict --verbose=4 Userscripts-Debug.app
+            codesign -dv --verbose=4 Userscripts-Debug.app
+
+      - run: |
+            cd build/Build/Products/Debug
+            ditto -c -k --sequesterRsrc --keepParent Userscripts-Debug.app Userscripts-Debug-macOS-Intel-adhoc.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+            name: Userscripts-Debug-macOS-Intel-adhoc
+            path: build/Build/Products/Debug/Userscripts-Debug-macOS-Intel-adhoc.zip
