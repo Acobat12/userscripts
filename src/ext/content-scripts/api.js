@@ -231,7 +231,9 @@ async function xhrDataProcessor(data) {
 	}
 	if (ArrayBuffer.isView(data)) {
 		return {
-			data: Array.from(new Uint8Array(data.buffer)),
+			data: Array.from(
+				new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+			),
 			type: "ArrayBufferView",
 		};
 	}
