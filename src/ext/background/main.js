@@ -2,24 +2,9 @@ import { openExtensionPage } from "../shared/utils.js";
 import * as settingsStorage from "../shared/settings.js";
 import { connectNative, sendNativeMessage } from "../shared/native.js";
 
-const VOT_YANDEX_API_HOST = "api.browser.yandex.ru";
-const VOT_DNR_RULE_ID_YANDEX_HEADERS = 910001;
-const VOT_ALLOWED_UA_CH_HEADERS = new Set([
-	"sec-ch-ua",
-	"sec-ch-ua-mobile",
-	"sec-ch-ua-platform",
-	"sec-ch-ua-full-version-list",
-]);
-const VOT_SUPPRESSED_UA_CH_HEADERS = [
-	"sec-ch-ua-full-version",
-	"sec-ch-ua-platform-version",
-	"sec-ch-ua-arch",
-	"sec-ch-ua-bitness",
-	"sec-ch-ua-model",
-	"sec-ch-ua-wow64",
-];
-const votDnrAppliedSignatures = new Map();
-let votDnrRuleUpdateQueue = Promise.resolve();
+const FORBIDDEN_HEADER_RULE_BASE_ID = 910000;
+const dnrAppliedSignatures = new Map();
+let dnrRuleUpdateQueue = Promise.resolve();
 
 function normalizeHeaderName(name) {
 	return String(name || "").trim();
@@ -75,23 +60,35 @@ function signatureFromDnrRequestHeaders(requestHeaders) {
 	return JSON.stringify(entries);
 }
 
-function queueVotDnrRuleUpdate(ruleId, signature, rule) {
-	if (signature === votDnrAppliedSignatures.get(ruleId)) {
+function queueDnrRuleUpdate(ruleId, signature, rule) {
+	if (signature === dnrAppliedSignatures.get(ruleId)) {
 		return Promise.resolve();
 	}
 
-	votDnrRuleUpdateQueue = votDnrRuleUpdateQueue
+	dnrRuleUpdateQueue = dnrRuleUpdateQueue
 		.catch(() => undefined)
 		.then(async () => {
-			if (signature === votDnrAppliedSignatures.get(ruleId)) return;
+			if (signature === dnrAppliedSignatures.get(ruleId)) return;
 			await updateSessionRulesCompat({
 				removeRuleIds: [ruleId],
 				addRules: [rule],
 			});
-			votDnrAppliedSignatures.set(ruleId, signature);
+			dnrAppliedSignatures.set(ruleId, signature);
 		});
 
-	return votDnrRuleUpdateQueue;
+	return dnrRuleUpdateQueue;
+}
+
+function hashStringToInt(value) {
+	let hash = 0;
+	for (let i = 0; i < value.length; i++) {
+		hash = (hash * 31 + value.charCodeAt(i)) | 0;
+	}
+	return Math.abs(hash);
+}
+
+function makeForbiddenHeaderRuleId(url) {
+	return FORBIDDEN_HEADER_RULE_BASE_ID + (hashStringToInt(url) % 8000) + 1;
 }
 
 function isVotYandexApiUrl(url) {
@@ -99,11 +96,15 @@ function isVotYandexApiUrl(url) {
 		const parsed = new URL(url);
 		return (
 			parsed.protocol === "https:" &&
-			String(parsed.hostname || "").toLowerCase() === VOT_YANDEX_API_HOST
+			String(parsed.hostname || "").toLowerCase() === "api.browser.yandex.ru"
 		);
 	} catch {
 		return false;
 	}
+}
+
+function shouldDebugVotTransport(url) {
+	return isVotYandexApiUrl(url);
 }
 
 function isForbiddenToSetViaXhr(headerName) {
@@ -117,45 +118,40 @@ function isForbiddenToSetViaXhr(headerName) {
 	return false;
 }
 
-function shouldStripVotYandexHeader(name) {
-	const normalized = normalizeHeaderName(name).toLowerCase();
-	if (!normalized) return false;
-	if (normalized === "origin" || normalized === "referer") return true;
-	if (VOT_SUPPRESSED_UA_CH_HEADERS.includes(normalized)) return true;
-	if (
-		normalized.startsWith("sec-ch-ua") &&
-		!VOT_ALLOWED_UA_CH_HEADERS.has(normalized)
-	) {
-		return true;
-	}
-	return false;
-}
-
-function filterVotYandexHeadersForDnr(headers) {
+function buildForbiddenHeadersForDnr(headers) {
 	const result = {};
+	const requestedForbiddenHeaderNames = new Set(
+		Object.keys(headers || {}).map((key) => normalizeHeaderName(key).toLowerCase()),
+	);
 	for (const [key, value] of Object.entries(headers || {})) {
 		const normalized = normalizeHeaderName(key);
 		if (!normalized) continue;
-		if (shouldStripVotYandexHeader(normalized)) continue;
 		result[normalized] = String(value);
 	}
-	return result;
+	return { headersToSet: result, requestedForbiddenHeaderNames };
 }
 
-async function ensureVotYandexHeaderRule(url, forbiddenHeaders) {
+async function ensureForbiddenHeaderRule(url, forbiddenHeaders) {
 	if (!hasDnr()) return;
-	if (!isVotYandexApiUrl(url)) return;
+	if (!forbiddenHeaders || !Object.keys(forbiddenHeaders).length) return;
 
-	const requestHeaders = [
-		{ header: "Origin", operation: "remove" },
-		{ header: "Referer", operation: "remove" },
-		...VOT_SUPPRESSED_UA_CH_HEADERS.map((header) => ({
-			header,
-			operation: "remove",
-		})),
-	];
+	let parsedUrl;
+	try {
+		parsedUrl = new URL(url);
+	} catch {
+		return;
+	}
 
-	const headersToSet = filterVotYandexHeadersForDnr(forbiddenHeaders);
+	const { headersToSet, requestedForbiddenHeaderNames } =
+		buildForbiddenHeadersForDnr(forbiddenHeaders);
+	const requestHeaders = [];
+
+	if (!requestedForbiddenHeaderNames.has("origin")) {
+		requestHeaders.push({ header: "Origin", operation: "remove" });
+	}
+	if (!requestedForbiddenHeaderNames.has("referer")) {
+		requestHeaders.push({ header: "Referer", operation: "remove" });
+	}
 	for (const [header, value] of Object.entries(headersToSet)) {
 		requestHeaders.push({
 			header: normalizeHeaderName(header),
@@ -164,25 +160,26 @@ async function ensureVotYandexHeaderRule(url, forbiddenHeaders) {
 		});
 	}
 
+	if (!requestHeaders.length) return;
+
 	const signature = signatureFromDnrRequestHeaders(requestHeaders);
+	const ruleId = makeForbiddenHeaderRuleId(
+		`${parsedUrl.origin}${parsedUrl.pathname}`,
+	);
 	const rule = {
-		id: VOT_DNR_RULE_ID_YANDEX_HEADERS,
+		id: ruleId,
 		priority: 1,
 		action: {
 			type: "modifyHeaders",
 			requestHeaders,
 		},
 		condition: {
-			urlFilter: "|https://api.browser.yandex.ru/",
+			urlFilter: `|${parsedUrl.origin}${parsedUrl.pathname}`,
 			resourceTypes: ["xmlhttprequest"],
 		},
 	};
 
-	await queueVotDnrRuleUpdate(
-		VOT_DNR_RULE_ID_YANDEX_HEADERS,
-		signature,
-		rule,
-	);
+	await queueDnrRuleUpdate(ruleId, signature, rule);
 }
 
 // first sorts files by run-at value, then by weight value
@@ -581,7 +578,15 @@ async function handleMessage(message, sender) {
 				});
 				// receive messages from content script and process them
 				port.onMessage.addListener((msg) => {
-					if (msg.name === "ABORT") xhr.abort();
+					if (msg.name === "ABORT") {
+						if (shouldDebugVotTransport(message.details?.url)) {
+							console.log("[Userscripts][VOT][xhr] received ABORT", {
+								url: message.details?.url,
+								method: message.details?.method || "GET",
+							});
+						}
+						xhr.abort();
+					}
 					if (msg.name === "DISCONNECT") port.disconnect();
 				});
 				// handle port disconnect and clean tasks
@@ -758,12 +763,86 @@ async function handleMessage(message, sender) {
 					if (isForbiddenToSetViaXhr(key)) forbiddenHeaders[key] = value;
 					else headers[key] = value;
 				}
+				if (shouldDebugVotTransport(url)) {
+					console.log("[Userscripts][VOT][xhr] start", {
+						url,
+						method,
+						responseType: details.responseType,
+						timeout: details.timeout,
+						headers,
+						forbiddenHeaders,
+					});
+				}
+				xhr.onabort = () => {
+					if (shouldDebugVotTransport(url)) {
+						console.log("[Userscripts][VOT][xhr] onabort", {
+							url,
+							method,
+							readyState: xhr.readyState,
+							status: xhr.status,
+							statusText: xhr.statusText,
+						});
+					}
+				};
+				xhr.onerror = () => {
+					if (shouldDebugVotTransport(url)) {
+						console.log("[Userscripts][VOT][xhr] onerror", {
+							url,
+							method,
+							readyState: xhr.readyState,
+							status: xhr.status,
+							statusText: xhr.statusText,
+						});
+					}
+				};
+				xhr.ontimeout = () => {
+					if (shouldDebugVotTransport(url)) {
+						console.log("[Userscripts][VOT][xhr] ontimeout", {
+							url,
+							method,
+							readyState: xhr.readyState,
+							status: xhr.status,
+							statusText: xhr.statusText,
+						});
+					}
+				};
+				xhr.onloadstart = () => {
+					if (shouldDebugVotTransport(url)) {
+						console.log("[Userscripts][VOT][xhr] onloadstart", {
+							url,
+							method,
+							readyState: xhr.readyState,
+						});
+					}
+				};
+				xhr.onloadend = () => {
+					if (shouldDebugVotTransport(url)) {
+						console.log("[Userscripts][VOT][xhr] onloadend", {
+							url,
+							method,
+							readyState: xhr.readyState,
+							status: xhr.status,
+							statusText: xhr.statusText,
+							responseURL: xhr.responseURL,
+							responseHeaders: xhr.readyState >= xhr.HEADERS_RECEIVED
+								? xhr.getAllResponseHeaders()
+								: "",
+						});
+					}
+				};
 				xhr.open(method, url, true, user, password);
 				try {
-					await ensureVotYandexHeaderRule(url, forbiddenHeaders);
+					await ensureForbiddenHeaderRule(url, forbiddenHeaders);
+					if (shouldDebugVotTransport(url)) {
+						console.log("[Userscripts][VOT][xhr] forbidden-header DNR ready", {
+							url,
+							method,
+							forbiddenHeaderNames: Object.keys(forbiddenHeaders),
+						});
+					}
 				} catch (error) {
 					console.warn(
-						"[Userscripts][VOT] Failed to apply Yandex header rule; direct transport may break:",
+						"[Userscripts][VOT] Failed to apply forbidden-header rule; direct transport may break:",
 						error,
 					);
 				}
@@ -772,6 +851,24 @@ async function handleMessage(message, sender) {
 					for (const [key, val] of Object.entries(headers)) {
 						xhr.setRequestHeader(key, val);
 					}
+				}
+				if (shouldDebugVotTransport(url)) {
+					console.log("[Userscripts][VOT][xhr] send", {
+						url,
+						method,
+						headerNames: Object.keys(headers),
+						forbiddenHeaderNames: Object.keys(forbiddenHeaders),
+						bodyKind:
+							body == null
+								? "empty"
+								: body instanceof Uint8Array
+									? "Uint8Array"
+									: body instanceof FormData
+										? "FormData"
+										: body instanceof URLSearchParams
+											? "URLSearchParams"
+											: typeof body,
+					});
 				}
 				xhr.send(body);
 			} catch (error) {
