@@ -1,4 +1,4 @@
-name: Userscripts-Debug-macOS-Intel-adhoc
+name: Userscripts-Debug-macOS-In
 
 on:
   workflow_dispatch:
