@@ -85,6 +85,7 @@ const XHR_ALLOWED_RESPONSE_TYPES = new Set([
 	"document",
 ]);
 const XHR_FORBIDDEN_HEADERS = new Set([
+	"authorization",
 	"connection",
 	"content-length",
 	"cookie",
@@ -94,11 +95,38 @@ const XHR_FORBIDDEN_HEADERS = new Set([
 	"referer",
 	"proxy-authorization",
 	"proxy-connection",
+	"www-authenticate",
 ]);
 const XHR_FORBIDDEN_HEADER_PREFIXES = ["proxy-", "sec-"];
 const XHR_MAX_TIMEOUT_MS = 120_000;
 const XHR_MAX_HEADER_VALUE_LENGTH = 8192;
 const XHR_MAX_HEADER_COUNT = 64;
+const PAGE_DATA_TIMEOUT_MS = 5000;
+const PAGE_DATA_MAX_ARGS_BYTES = 256 * 1024;
+const PAGE_DATA_MAX_RESULT_BYTES = 2 * 1024 * 1024;
+const PAGE_DATA_MAX_DEPTH = 32;
+const PAGE_DATA_MAX_ARRAY_LENGTH = 4096;
+const PAGE_DATA_MAX_OBJECT_KEYS = 128;
+const PAGE_DATA_MAX_OBJECT_KEY_LENGTH = 512;
+const pageDataTextEncoder =
+	typeof TextEncoder === "function" ? new TextEncoder() : null;
+const safePageAddEventListener = Function.prototype.call.bind(
+	EventTarget.prototype.addEventListener,
+);
+const safePageRemoveEventListener = Function.prototype.call.bind(
+	EventTarget.prototype.removeEventListener,
+);
+const safeCreateElement = Function.prototype.call.bind(
+	Document.prototype.createElement,
+);
+const safeAttachShadow = Function.prototype.call.bind(
+	Element.prototype.attachShadow,
+);
+const safeAppendChild = Function.prototype.call.bind(Node.prototype.appendChild);
+const safeRemoveChild = Function.prototype.call.bind(Node.prototype.removeChild);
+const safeRemoveNode = typeof Element.prototype.remove === "function"
+	? Function.prototype.call.bind(Element.prototype.remove)
+	: null;
 
 function randomRequestId() {
 	if (typeof globalThis.crypto?.randomUUID === "function") {
@@ -113,6 +141,307 @@ function randomRequestId() {
 		return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 	}
 	return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+}
+
+function pageDataByteLength(value) {
+	const text = String(value ?? "");
+	if (pageDataTextEncoder) {
+		return pageDataTextEncoder.encode(text).byteLength;
+	}
+	return text.length * 2;
+}
+
+function isPageDataPlainObject(value) {
+	if (value == null || typeof value !== "object" || Array.isArray(value)) {
+		return false;
+	}
+	try {
+		const prototype = Object.getPrototypeOf(value);
+		return prototype === Object.prototype || prototype === null;
+	} catch {
+		return false;
+	}
+}
+
+function isSafePageDataObjectKey(key) {
+	return (
+		key !== "__proto__" &&
+		key !== "prototype" &&
+		key !== "constructor"
+	);
+}
+
+function normalizePageDataSerializableValue(
+	value,
+	depth = 0,
+	seen = new WeakSet(),
+) {
+	if (depth > PAGE_DATA_MAX_DEPTH) {
+		throw new Error("getPageData value exceeds maximum depth");
+	}
+	if (value === null) return null;
+	switch (typeof value) {
+		case "string":
+		case "boolean":
+			return value;
+		case "number":
+			if (!Number.isFinite(value)) {
+				throw new Error("getPageData numeric value must be finite");
+			}
+			return value;
+		case "object":
+			break;
+		default:
+			throw new Error("getPageData value type is not supported");
+	}
+	if (seen.has(value)) {
+		throw new Error("getPageData value must not contain cycles");
+	}
+	seen.add(value);
+	try {
+		if (Array.isArray(value)) {
+			if (value.length > PAGE_DATA_MAX_ARRAY_LENGTH) {
+				throw new Error("getPageData array is too large");
+			}
+			return value.map((item) =>
+				normalizePageDataSerializableValue(item, depth + 1, seen),
+			);
+		}
+		if (!isPageDataPlainObject(value)) {
+			throw new Error("getPageData object must be plain");
+		}
+		const result = {};
+		const entries = Object.entries(value);
+		if (entries.length > PAGE_DATA_MAX_OBJECT_KEYS) {
+			throw new Error("getPageData object has too many keys");
+		}
+		for (const [key, entryValue] of entries) {
+			if (key.length > PAGE_DATA_MAX_OBJECT_KEY_LENGTH) {
+				throw new Error("getPageData object key is too long");
+			}
+			if (!isSafePageDataObjectKey(key)) {
+				throw new Error("getPageData object key is not allowed");
+			}
+			result[key] = normalizePageDataSerializableValue(
+				entryValue,
+				depth + 1,
+				seen,
+			);
+		}
+		return result;
+	} finally {
+		seen.delete(value);
+	}
+}
+
+function buildPageDataScript(responseEvent, extractorSource, argsJson) {
+	return `(() => {
+	const __US_RESPONSE_EVENT__ = ${JSON.stringify(responseEvent)};
+	const __US_ARGS__ = ${argsJson};
+	const __US_MAX_DEPTH__ = ${PAGE_DATA_MAX_DEPTH};
+	const __US_MAX_ARRAY_LENGTH__ = ${PAGE_DATA_MAX_ARRAY_LENGTH};
+	const __US_MAX_OBJECT_KEYS__ = ${PAGE_DATA_MAX_OBJECT_KEYS};
+	const __US_MAX_OBJECT_KEY_LENGTH__ = ${PAGE_DATA_MAX_OBJECT_KEY_LENGTH};
+	const __US_MAX_RESULT_BYTES__ = ${PAGE_DATA_MAX_RESULT_BYTES};
+	const __US_byteLength = (value) => {
+		const text = String(value ?? "");
+		if (typeof TextEncoder === "function") {
+			return new TextEncoder().encode(text).byteLength;
+		}
+		return text.length * 2;
+	};
+	const __US_isPlainObject = (value) => {
+		if (value == null || typeof value !== "object" || Array.isArray(value)) {
+			return false;
+		}
+		try {
+			const prototype = Object.getPrototypeOf(value);
+			return prototype === Object.prototype || prototype === null;
+		} catch {
+			return false;
+		}
+	};
+	const __US_isSafeKey = (key) =>
+		key !== "__proto__" &&
+		key !== "prototype" &&
+		key !== "constructor";
+	const __US_normalize = (value, depth = 0, seen = new WeakSet()) => {
+		if (depth > __US_MAX_DEPTH__) {
+			throw new Error("Page data result exceeds maximum depth");
+		}
+		if (value === null) return null;
+		switch (typeof value) {
+			case "string":
+			case "boolean":
+				return value;
+			case "number":
+				if (!Number.isFinite(value)) {
+					throw new Error("Page data result contains a non-finite number");
+				}
+				return value;
+			case "object":
+				break;
+			default:
+				throw new Error("Page data result contains an unsupported type");
+		}
+		if (seen.has(value)) {
+			throw new Error("Page data result contains a cycle");
+		}
+		seen.add(value);
+		try {
+			if (Array.isArray(value)) {
+				if (value.length > __US_MAX_ARRAY_LENGTH__) {
+					throw new Error("Page data result array is too large");
+				}
+				return value.map((item) => __US_normalize(item, depth + 1, seen));
+			}
+			if (!__US_isPlainObject(value)) {
+				throw new Error("Page data result object must be plain");
+			}
+			const entries = Object.entries(value);
+			if (entries.length > __US_MAX_OBJECT_KEYS__) {
+				throw new Error("Page data result object has too many keys");
+			}
+			const result = {};
+			for (const [key, entryValue] of entries) {
+				if (key.length > __US_MAX_OBJECT_KEY_LENGTH__) {
+					throw new Error("Page data result object key is too long");
+				}
+				if (!__US_isSafeKey(key)) {
+					throw new Error("Page data result object key is not allowed");
+				}
+				result[key] = __US_normalize(entryValue, depth + 1, seen);
+			}
+			return result;
+		} finally {
+			seen.delete(value);
+		}
+	};
+	const __US_send = (payload) => {
+		let json;
+		try {
+			json = JSON.stringify(payload);
+		} catch (error) {
+			json = JSON.stringify({
+				ok: false,
+				error: String(error?.message || error),
+			});
+		}
+		if (__US_byteLength(json) > __US_MAX_RESULT_BYTES__) {
+			json = JSON.stringify({
+				ok: false,
+				error: "Page data result is too large",
+			});
+		}
+		document.dispatchEvent(new CustomEvent(__US_RESPONSE_EVENT__, {
+			detail: json,
+		}));
+	};
+	try {
+		const __US_extractor = (${extractorSource});
+		Promise.resolve(__US_extractor(...__US_ARGS__)).then(
+			(value) => {
+				try {
+					__US_send({
+						ok: true,
+						value: __US_normalize(value),
+					});
+				} catch (error) {
+					__US_send({
+						ok: false,
+						error: String(error?.message || error),
+					});
+				}
+			},
+			(error) => {
+				__US_send({
+					ok: false,
+					error: String(error?.message || error),
+				});
+			},
+		);
+	} catch (error) {
+		__US_send({
+			ok: false,
+			error: String(error?.message || error),
+		});
+	}
+})();`;
+}
+
+async function getPageData(extractor, ...args) {
+	if (typeof extractor !== "function") {
+		return Promise.reject(new Error("getPageData requires a function extractor"));
+	}
+	const normalizedArgs = normalizePageDataSerializableValue(args);
+	const argsJson = JSON.stringify(normalizedArgs);
+	if (pageDataByteLength(argsJson) > PAGE_DATA_MAX_ARGS_BYTES) {
+		return Promise.reject(new Error("getPageData arguments are too large"));
+	}
+	const responseEvent = `__userscripts_page_data_response_${randomRequestId()}__`;
+	return new Promise((resolve, reject) => {
+		let host = null;
+		let settled = false;
+		let timeoutId;
+		const cleanup = () => {
+			safePageRemoveEventListener(document, responseEvent, onResponse);
+			clearTimeout(timeoutId);
+			try {
+				if (host && safeRemoveNode) {
+					safeRemoveNode(host);
+				} else if (host?.parentNode) {
+					safeRemoveChild(host.parentNode, host);
+				}
+			} catch {
+				// Ignore cleanup failures.
+			}
+		};
+		const onResponse = (event) => {
+			if (settled || typeof event.detail !== "string") return;
+			settled = true;
+			cleanup();
+			try {
+				if (pageDataByteLength(event.detail) > PAGE_DATA_MAX_RESULT_BYTES) {
+					throw new Error("getPageData result is too large");
+				}
+				const payload = JSON.parse(event.detail);
+				if (payload?.ok === true) {
+					resolve(normalizePageDataSerializableValue(payload.value));
+					return;
+				}
+				reject(new Error(payload?.error || "getPageData failed"));
+			} catch (error) {
+				reject(error);
+			}
+		};
+		try {
+			safePageAddEventListener(document, responseEvent, onResponse);
+			timeoutId = setTimeout(() => {
+				if (settled) return;
+				settled = true;
+				cleanup();
+				reject(new Error("getPageData timed out"));
+			}, PAGE_DATA_TIMEOUT_MS);
+			host = safeCreateElement(document, "div");
+			host.style.display = "none";
+			const shadowRoot = safeAttachShadow(host, { mode: "closed" });
+			const tag = safeCreateElement(document, "script");
+			tag.textContent = buildPageDataScript(
+				responseEvent,
+				extractor.toString(),
+				argsJson,
+			);
+			safeAppendChild(shadowRoot, tag);
+			safeAppendChild(
+				document.body ?? document.head ?? document.documentElement,
+				host,
+			);
+		} catch (error) {
+			settled = true;
+			cleanup();
+			reject(error);
+		}
+	});
 }
 
 function getXhrContext(value) {
@@ -681,6 +1010,7 @@ export default {
 	getValue,
 	listValues,
 	deleteValue,
+	getPageData,
 	openInTab,
 	getTab,
 	saveTab,
@@ -693,3 +1023,4 @@ export default {
 	xmlHttpRequest,
 	GM_xmlhttpRequest,
 };
+
