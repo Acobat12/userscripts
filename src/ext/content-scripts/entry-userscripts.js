@@ -23,6 +23,18 @@ function pageGrantBridgeEventName(id, type) {
 	return `__userscripts_page_grant_bridge_${id}_${type}__`;
 }
 
+function pageGrantBridgeRandomId() {
+	if (
+		typeof globalThis.crypto?.getRandomValues === "function" &&
+		typeof Uint8Array === "function"
+	) {
+		const bytes = new Uint8Array(16);
+		globalThis.crypto.getRandomValues(bytes);
+		return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+	}
+	return `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+}
+
 function __US_getTypedArrayConstructor(viewName) {
 	const typedArrayConstructors = {
 		Int8Array,
@@ -237,6 +249,22 @@ function isPageGrantMethodSupported(method) {
 	);
 }
 
+function getAllowedPageGrantMethods(grants) {
+	const methods = new Set();
+	for (const grant of grants || []) {
+		const normalizedMethod = normalizePageGrantMethod(grant);
+		if (isPageGrantMethodSupported(normalizedMethod)) {
+			methods.add(normalizedMethod);
+		}
+	}
+	return methods;
+}
+
+function isPageGrantMethodAllowed(method, allowedMethods) {
+	const normalizedMethod = normalizePageGrantMethod(method);
+	return allowedMethods instanceof Set && allowedMethods.has(normalizedMethod);
+}
+
 async function callPageGrantMethod(method, filename, args = []) {
 	const normalizedMethod = normalizePageGrantMethod(method);
 	if (normalizedMethod === "GM_xmlhttpRequest") {
@@ -252,13 +280,7 @@ async function callPageGrantMethod(method, filename, args = []) {
 }
 
 function getPageGrantClientMethodDefinitions(grants) {
-	const methods = new Set();
-	for (const grant of grants || []) {
-		const normalizedMethod = normalizePageGrantMethod(grant);
-		if (isPageGrantMethodSupported(normalizedMethod)) {
-			methods.add(normalizedMethod);
-		}
-	}
+	const methods = getAllowedPageGrantMethods(grants);
 
 	const wrapperLines = [];
 	const assignmentLines = [];
@@ -385,10 +407,11 @@ async function serializableXhrResponse(response) {
 
 function installPageGrantBridge(userscript, grants) {
 	const filename = userscript.scriptObject.filename;
-	const bridgeId = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+	const bridgeId = pageGrantBridgeRandomId();
 	const requestEvent = pageGrantBridgeEventName(bridgeId, "request");
 	const responseEvent = pageGrantBridgeEventName(bridgeId, "response");
 	const abortEvent = pageGrantBridgeEventName(bridgeId, "abort");
+	const allowedMethods = getAllowedPageGrantMethods(grants);
 	const xhrControls = new Map();
 
 	const respond = (id, payload) => {
@@ -404,6 +427,9 @@ function installPageGrantBridge(userscript, grants) {
 		if (!detail || detail.bridgeId !== bridgeId || !detail.id) return;
 		const { id, method, args = [] } = detail;
 		try {
+			if (!isPageGrantMethodAllowed(method, allowedMethods)) {
+				throw new Error(`Bridge method not granted: ${method}`);
+			}
 			if (normalizePageGrantMethod(method) === "GM_xmlhttpRequest") {
 				const details = { ...(args[0] || {}) };
 				if ("data" in details) {
@@ -862,3 +888,4 @@ async function initialize() {
 }
 
 initialize();
+
