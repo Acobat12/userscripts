@@ -68,10 +68,14 @@ async function sendMessageProxy(message) {
 }
 
 async function openInTab(url, openInBackground = false) {
+	let parsedUrl;
 	try {
-		new URL(url);
+		parsedUrl = new URL(url, globalThis.location?.href);
 	} catch (error) {
 		return Promise.reject(error);
+	}
+	if (["javascript:", "data:"].includes(parsedUrl.protocol)) {
+		return Promise.reject(new Error("openInTab invalid url protocol"));
 	}
 	return sendMessageProxy({
 		name: "API_OPEN_TAB",
