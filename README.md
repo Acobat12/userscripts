@@ -154,6 +154,7 @@ Userscripts Safari currently supports the following userscript metadata:
   - allows the user to choose which context to inject the script into
   - values: `auto` (default), `content`, `page`
     - `GM` apis are only available when using `content`
+    - when a script uses `@grant`, page/auto injection is forced to `content`; use `GM.getPageData(...)` if the script still needs page-context globals
   - works like [violentmonkey](https://violentmonkey.github.io/api/metadata-block/#inject-into)
 - `@run-at`
   - allows the user to choose the injection timing
@@ -217,6 +218,15 @@ For API type definitions, please refer to: [`types.d.ts`](https://github.com/use
 - `GM.addStyle(css)`
   - `css: String`
   - returns a [`Promise`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise), resolved if succeeds, rejected with error message if fails
+- `GM.getPageData(extractor, ...args)`
+  - `extractor: Function`
+  - `args: Any[]` - optional, must be JSON-serializable
+  - runs the provided extractor function in the page context and returns only plain JSON-serializable data
+  - functions, DOM nodes, class instances, blobs, streams, and other active objects are rejected
+  - reserved object keys such as `__proto__`, `constructor`, and `prototype` are rejected
+  - returned values are untrusted page data, not privileged handles
+  - use this when a script needs page globals while still keeping `GM_*` APIs in the content-script context
+  - returns a [`Promise`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise), resolved with the extractor result if succeeds, rejected with error message if fails
 - `GM.setValue(key, value)`
   - `key: String`
   - `value: Any` - any can be JSON-serialized
@@ -385,6 +395,11 @@ The second best way to help out is to sign up to beta test new versions of the a
 Userscripts does not collect any data from its users nor monitor activities or actions you perform within the application and extension. This means everything that you do with the application and extension is private to you and is never shared with the developers or third parties. Since there is no data collection, there is no data retention of any kind.
 
 ## License
+
+Copyright © 2018-2025 Justin Wasack
+
+Licensed under the [GNU General Public License v3.0](/LICENSE) license for all open source applications. A commercial license is required for all other applications.
+
 
 Copyright © 2018-2025 Justin Wasack
 
