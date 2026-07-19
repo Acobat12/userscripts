@@ -102,14 +102,21 @@ const XHR_MAX_TIMEOUT_MS = 120_000;
 const XHR_MAX_HEADER_VALUE_LENGTH = 8192;
 const XHR_MAX_HEADER_COUNT = 64;
 const PAGE_DATA_TIMEOUT_MS = 5000;
+const PAGE_DATA_MAX_EXTRACTOR_BYTES = 100_000;
 const PAGE_DATA_MAX_ARGS_BYTES = 256 * 1024;
 const PAGE_DATA_MAX_RESULT_BYTES = 2 * 1024 * 1024;
 const PAGE_DATA_MAX_DEPTH = 32;
 const PAGE_DATA_MAX_ARRAY_LENGTH = 4096;
 const PAGE_DATA_MAX_OBJECT_KEYS = 128;
 const PAGE_DATA_MAX_OBJECT_KEY_LENGTH = 512;
+const PAGE_DATA_MAX_CALLS_PER_WINDOW = 20;
+const PAGE_DATA_RATE_WINDOW_MS = 1000;
+const PAGE_DATA_MAX_ACTIVE_CALLS = 8;
 const pageDataTextEncoder =
 	typeof TextEncoder === "function" ? new TextEncoder() : null;
+const safeFunctionToString = Function.prototype.call.bind(
+	Function.prototype.toString,
+);
 const safePageAddEventListener = Function.prototype.call.bind(
 	EventTarget.prototype.addEventListener,
 );
@@ -127,6 +134,8 @@ const safeRemoveChild = Function.prototype.call.bind(Node.prototype.removeChild)
 const safeRemoveNode = typeof Element.prototype.remove === "function"
 	? Function.prototype.call.bind(Element.prototype.remove)
 	: null;
+const pageDataCallTimes = [];
+let pageDataActiveCalls = 0;
 
 function randomRequestId() {
 	if (typeof globalThis.crypto?.randomUUID === "function") {
@@ -171,6 +180,29 @@ function isSafePageDataObjectKey(key) {
 	);
 }
 
+function reservePageDataCall() {
+	const now = Date.now();
+	while (
+		pageDataCallTimes.length &&
+		now - pageDataCallTimes[0] >= PAGE_DATA_RATE_WINDOW_MS
+	) {
+		pageDataCallTimes.shift();
+	}
+	if (pageDataCallTimes.length >= PAGE_DATA_MAX_CALLS_PER_WINDOW) {
+		throw new Error("getPageData rate limit exceeded");
+	}
+	if (pageDataActiveCalls >= PAGE_DATA_MAX_ACTIVE_CALLS) {
+		throw new Error("getPageData has too many active calls");
+	}
+	pageDataCallTimes.push(now);
+	pageDataActiveCalls += 1;
+	return () => {
+		if (pageDataActiveCalls > 0) {
+			pageDataActiveCalls -= 1;
+		}
+	};
+}
+
 function normalizePageDataSerializableValue(
 	value,
 	depth = 0,
@@ -210,7 +242,7 @@ function normalizePageDataSerializableValue(
 		if (!isPageDataPlainObject(value)) {
 			throw new Error("getPageData object must be plain");
 		}
-		const result = {};
+		const result = Object.create(null);
 		const entries = Object.entries(value);
 		if (entries.length > PAGE_DATA_MAX_OBJECT_KEYS) {
 			throw new Error("getPageData object has too many keys");
@@ -302,7 +334,7 @@ function buildPageDataScript(responseEvent, extractorSource, argsJson) {
 			if (entries.length > __US_MAX_OBJECT_KEYS__) {
 				throw new Error("Page data result object has too many keys");
 			}
-			const result = {};
+			const result = Object.create(null);
 			for (const [key, entryValue] of entries) {
 				if (key.length > __US_MAX_OBJECT_KEY_LENGTH__) {
 					throw new Error("Page data result object key is too long");
@@ -373,19 +405,39 @@ async function getPageData(extractor, ...args) {
 	if (typeof extractor !== "function") {
 		return Promise.reject(new Error("getPageData requires a function extractor"));
 	}
+	let extractorSource;
+	try {
+		extractorSource = safeFunctionToString(extractor);
+	} catch (error) {
+		return Promise.reject(error);
+	}
+	if (pageDataByteLength(extractorSource) > PAGE_DATA_MAX_EXTRACTOR_BYTES) {
+		return Promise.reject(new Error("getPageData extractor is too large"));
+	}
 	const normalizedArgs = normalizePageDataSerializableValue(args);
 	const argsJson = JSON.stringify(normalizedArgs);
 	if (pageDataByteLength(argsJson) > PAGE_DATA_MAX_ARGS_BYTES) {
 		return Promise.reject(new Error("getPageData arguments are too large"));
+	}
+	let releasePageDataCall;
+	try {
+		releasePageDataCall = reservePageDataCall();
+	} catch (error) {
+		return Promise.reject(error);
 	}
 	const responseEvent = `__userscripts_page_data_response_${randomRequestId()}__`;
 	return new Promise((resolve, reject) => {
 		let host = null;
 		let settled = false;
 		let timeoutId;
+		let releaseCall = releasePageDataCall;
 		const cleanup = () => {
 			safePageRemoveEventListener(document, responseEvent, onResponse);
 			clearTimeout(timeoutId);
+			if (releaseCall) {
+				releaseCall();
+				releaseCall = null;
+			}
 			try {
 				if (host && safeRemoveNode) {
 					safeRemoveNode(host);
@@ -428,7 +480,7 @@ async function getPageData(extractor, ...args) {
 			const tag = safeCreateElement(document, "script");
 			tag.textContent = buildPageDataScript(
 				responseEvent,
-				extractor.toString(),
+				extractorSource,
 				argsJson,
 			);
 			safeAppendChild(shadowRoot, tag);
@@ -1023,4 +1075,3 @@ export default {
 	xmlHttpRequest,
 	GM_xmlhttpRequest,
 };
-
