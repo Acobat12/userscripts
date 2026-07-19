@@ -265,6 +265,131 @@ function isPageGrantMethodAllowed(method, allowedMethods) {
 	return allowedMethods instanceof Set && allowedMethods.has(normalizedMethod);
 }
 
+const PAGE_BRIDGE_GRANT_TIMEOUT_MS = 30_000;
+const PAGE_BRIDGE_MAX_ARGS_LENGTH = 16;
+const PAGE_BRIDGE_MAX_ACTIVE_XHR = 8;
+const PAGE_BRIDGE_MAX_TRACKED_REQUEST_IDS = 2048;
+const PAGE_BRIDGE_REQUEST_ID_MIN_LENGTH = 16;
+const PAGE_BRIDGE_REQUEST_ID_MAX_LENGTH = 128;
+const PAGE_BRIDGE_MAX_STORAGE_KEY_LENGTH = 512;
+const PAGE_BRIDGE_MAX_URL_LENGTH = 8192;
+const PAGE_BRIDGE_MAX_STYLE_LENGTH = 1_000_000;
+const PAGE_BRIDGE_MAX_OBJECT_KEYS = 128;
+
+function isPageGrantPlainObject(value) {
+	return value != null && typeof value === "object" && !Array.isArray(value);
+}
+
+function copyPageGrantPlainObject(value, maxKeys = PAGE_BRIDGE_MAX_OBJECT_KEYS) {
+	if (!isPageGrantPlainObject(value)) {
+		throw new Error("Bridge object must be a plain object");
+	}
+	const descriptors = Object.getOwnPropertyDescriptors(value);
+	const copy = {};
+	let copiedKeys = 0;
+	for (const [key, descriptor] of Object.entries(descriptors)) {
+		if (!descriptor.enumerable) continue;
+		if (
+			typeof descriptor.get === "function" ||
+			typeof descriptor.set === "function"
+		) {
+			throw new Error("Bridge accessors are not supported");
+		}
+		copiedKeys += 1;
+		if (copiedKeys > maxKeys) {
+			throw new Error("Bridge object has too many keys");
+		}
+		copy[key] = descriptor.value;
+	}
+	return copy;
+}
+
+function consumePageGrantRequestId(id, seenRequestIds) {
+	if (
+		typeof id !== "string" ||
+		id.length < PAGE_BRIDGE_REQUEST_ID_MIN_LENGTH ||
+		id.length > PAGE_BRIDGE_REQUEST_ID_MAX_LENGTH ||
+		seenRequestIds.has(id)
+	) {
+		return false;
+	}
+	seenRequestIds.add(id);
+	if (seenRequestIds.size > PAGE_BRIDGE_MAX_TRACKED_REQUEST_IDS) {
+		const oldestId = seenRequestIds.values().next().value;
+		if (oldestId) seenRequestIds.delete(oldestId);
+	}
+	return true;
+}
+
+function validatePageGrantArgs(method, args) {
+	if (!Array.isArray(args) || args.length > PAGE_BRIDGE_MAX_ARGS_LENGTH) {
+		return false;
+	}
+	switch (normalizePageGrantMethod(method)) {
+		case "addStyle":
+			return (
+				args.length === 1 &&
+				typeof args[0] === "string" &&
+				args[0].length > 0 &&
+				args[0].length <= PAGE_BRIDGE_MAX_STYLE_LENGTH
+			);
+		case "openInTab":
+			return (
+				args.length >= 1 &&
+				args.length <= 2 &&
+				typeof args[0] === "string" &&
+				args[0].length > 0 &&
+				args[0].length <= PAGE_BRIDGE_MAX_URL_LENGTH &&
+				(args.length === 1 || typeof args[1] === "boolean")
+			);
+		case "closeTab":
+			return (
+				args.length <= 1 &&
+				(args.length === 0 ||
+					typeof args[0] === "number" ||
+					typeof args[0] === "string")
+			);
+		case "getTab":
+		case "listValues":
+			return args.length === 0;
+		case "saveTab":
+			return args.length === 1 && args[0] != null;
+		case "setClipboard":
+			return (
+				args.length >= 1 &&
+				args.length <= 2 &&
+				typeof args[0] === "string" &&
+				(args.length === 1 || typeof args[1] === "string")
+			);
+		case "setValue":
+			return (
+				args.length === 2 &&
+				typeof args[0] === "string" &&
+				args[0].length > 0 &&
+				args[0].length <= PAGE_BRIDGE_MAX_STORAGE_KEY_LENGTH
+			);
+		case "getValue":
+			return (
+				args.length >= 1 &&
+				args.length <= 2 &&
+				typeof args[0] === "string" &&
+				args[0].length > 0 &&
+				args[0].length <= PAGE_BRIDGE_MAX_STORAGE_KEY_LENGTH
+			);
+		case "deleteValue":
+			return (
+				args.length === 1 &&
+				typeof args[0] === "string" &&
+				args[0].length > 0 &&
+				args[0].length <= PAGE_BRIDGE_MAX_STORAGE_KEY_LENGTH
+			);
+		case "GM_xmlhttpRequest":
+			return args.length === 1 && isPageGrantPlainObject(args[0]);
+		default:
+			return true;
+	}
+}
+
 async function callPageGrantMethod(method, filename, args = []) {
 	const normalizedMethod = normalizePageGrantMethod(method);
 	if (normalizedMethod === "GM_xmlhttpRequest") {
@@ -407,12 +532,19 @@ async function serializableXhrResponse(response) {
 
 function installPageGrantBridge(userscript, grants) {
 	const filename = userscript.scriptObject.filename;
+	const connect = userscript.scriptObject.connect;
+	const hasConnectMetadata = Object.prototype.hasOwnProperty.call(
+		userscript.scriptObject,
+		"connect",
+	);
+	const pageOrigin = globalThis.location?.origin || "";
 	const bridgeId = pageGrantBridgeRandomId();
 	const requestEvent = pageGrantBridgeEventName(bridgeId, "request");
 	const responseEvent = pageGrantBridgeEventName(bridgeId, "response");
 	const abortEvent = pageGrantBridgeEventName(bridgeId, "abort");
 	const allowedMethods = getAllowedPageGrantMethods(grants);
 	const xhrControls = new Map();
+	const seenRequestIds = new Set();
 
 	const respond = (id, payload) => {
 		document.dispatchEvent(
@@ -426,12 +558,22 @@ function installPageGrantBridge(userscript, grants) {
 		const detail = event.detail;
 		if (!detail || detail.bridgeId !== bridgeId || !detail.id) return;
 		const { id, method, args = [] } = detail;
+		if (!consumePageGrantRequestId(id, seenRequestIds)) return;
 		try {
 			if (!isPageGrantMethodAllowed(method, allowedMethods)) {
 				throw new Error(`Bridge method not granted: ${method}`);
 			}
+			if (!validatePageGrantArgs(method, args)) {
+				throw new Error(`Invalid bridge arguments for ${method}`);
+			}
 			if (normalizePageGrantMethod(method) === "GM_xmlhttpRequest") {
-				const details = { ...(args[0] || {}) };
+				if (xhrControls.size >= PAGE_BRIDGE_MAX_ACTIVE_XHR) {
+					throw new Error("Too many active GM_xmlhttpRequest calls");
+				}
+				const details = copyPageGrantPlainObject(args[0]);
+				if (isPageGrantPlainObject(details.headers)) {
+					details.headers = copyPageGrantPlainObject(details.headers);
+				}
 				if ("data" in details) {
 					details.data = __US_restoreBridgeRequestData(details.data);
 				}
@@ -461,8 +603,23 @@ function installPageGrantBridge(userscript, grants) {
 						}
 					};
 				}
-				const control = USAPI.GM_xmlhttpRequest(details);
-				xhrControls.set(id, control);
+				xhrControls.set(id, null);
+				try {
+					const control = USAPI.GM_xmlhttpRequest.call(
+						{
+							US_filename: filename,
+							US_connect: connect,
+							US_hasConnectMetadata: hasConnectMetadata,
+							US_pageOrigin: pageOrigin,
+							US_enforceSameOriginWithoutConnect: true,
+						},
+						details,
+					);
+					xhrControls.set(id, control);
+				} catch (error) {
+					xhrControls.delete(id);
+					throw error;
+				}
 				return;
 			}
 			const result = await callPageGrantMethod(method, filename, args);
@@ -483,8 +640,23 @@ function installPageGrantBridge(userscript, grants) {
 		xhrControls.delete(detail.id);
 	};
 
+	const cleanup = () => {
+		document.removeEventListener(requestEvent, handleRequest);
+		document.removeEventListener(abortEvent, handleAbort);
+		for (const control of xhrControls.values()) {
+			try {
+				control?.abort?.();
+			} catch {
+				// Ignore cleanup failures.
+			}
+		}
+		xhrControls.clear();
+		seenRequestIds.clear();
+	};
+
 	document.addEventListener(requestEvent, handleRequest);
 	document.addEventListener(abortEvent, handleAbort);
+	window.addEventListener("pagehide", cleanup, { once: true });
 
 	userscript.pageGrantBridge = {
 		bridgeId,
@@ -512,7 +684,9 @@ function getPageGrantClientPreamble(userscript) {
 		`const __US_restoreTypedArrayView = ${__US_restoreTypedArrayView.toString()};\n` +
 		`const __US_serializeBridgeRequestData = ${__US_serializeBridgeRequestData.toString()};\n` +
 		`const __US_restoreBridgeRequestData = ${__US_restoreBridgeRequestData.toString()};\n` +
-		`const __US_randomId = () => Date.now().toString(36) + '_' + Math.random().toString(36).slice(2);\n` +
+		`const __US_randomId = ${pageGrantBridgeRandomId.toString()};\n` +
+		`const __US_BRIDGE_CALL_TIMEOUT_MS = ${PAGE_BRIDGE_GRANT_TIMEOUT_MS};\n` +
+		`const __US_XHR_TIMEOUT_GRACE_MS = 5000;\n` +
 		`const __US_terminalXhrHandlers = new Set(['onloadend','onabort','onerror','ontimeout']);\n` +
 		`const __US_parseHeaders = (raw) => {\n` +
 		`  const headers = {};\n` +
@@ -559,13 +733,19 @@ function getPageGrantClientPreamble(userscript) {
 		`};\n` +
 		`const __US_callGrant = (method, args = []) => new Promise((resolve, reject) => {\n` +
 		`  const id = __US_randomId();\n` +
+		`  let settled = false;\n` +
+		`  let timeoutId;\n` +
+		`  const cleanup = () => { document.removeEventListener(__US_RESPONSE_EVENT__, onResponse); clearTimeout(timeoutId); };\n` +
 		`  const onResponse = (event) => {\n` +
 		`    const detail = event.detail || {};\n` +
-		`    if (detail.id !== id) return;\n` +
-		`    if (detail.type === 'result') { document.removeEventListener(__US_RESPONSE_EVENT__, onResponse); resolve(detail.result); return; }\n` +
-		`    if (detail.type === 'error') { document.removeEventListener(__US_RESPONSE_EVENT__, onResponse); reject(new Error(detail.error || 'Userscripts grant bridge error')); }\n` +
+		`    if (detail.id !== id || settled) return;\n` +
+		`    settled = true;\n` +
+		`    cleanup();\n` +
+		`    if (detail.type === 'result') { resolve(detail.result); return; }\n` +
+		`    reject(new Error(detail.error || 'Userscripts grant bridge error'));\n` +
 		`  };\n` +
 		`  document.addEventListener(__US_RESPONSE_EVENT__, onResponse);\n` +
+		`  timeoutId = setTimeout(() => { if (settled) return; settled = true; cleanup(); reject(new Error('Userscripts grant bridge timeout')); }, __US_BRIDGE_CALL_TIMEOUT_MS);\n` +
 		`  document.dispatchEvent(new CustomEvent(__US_REQUEST_EVENT__, { detail: { bridgeId: __US_BRIDGE_ID__, id, method, args } }));\n` +
 		`});\n` +
 		(hasXmlHttpRequest
@@ -575,41 +755,52 @@ function getPageGrantClientPreamble(userscript) {
 				`  const payload = { ...(details || {}) };\n` +
 				`  let requestStarted = false;\n` +
 				`  let requestCancelled = false;\n` +
+				`  let settled = false;\n` +
+				`  let timeoutId;\n` +
+				`  const cleanup = () => { document.removeEventListener(__US_RESPONSE_EVENT__, onResponse); clearTimeout(timeoutId); };\n` +
+				`  const fail = (error) => {\n` +
+				`    if (settled) return;\n` +
+				`    settled = true;\n` +
+				`    cleanup();\n` +
+				`    const errorObj = { error: String(error?.message || error) };\n` +
+				`    if (typeof callbacks.onerror === 'function') callbacks.onerror(errorObj);\n` +
+				`    if (typeof callbacks.onloadend === 'function') callbacks.onloadend(errorObj);\n` +
+				`  };\n` +
 				`  for (const key of ['onreadystatechange','onloadstart','onprogress','onabort','onerror','onload','ontimeout','onloadend']) {\n` +
 				`    if (typeof payload[key] === 'function') { callbacks[key] = payload[key]; delete payload[key]; }\n` +
 				`  }\n` +
 				`  const onResponse = (event) => {\n` +
 				`    const detail = event.detail || {};\n` +
-				`    if (detail.id !== id) return;\n` +
+				`    if (detail.id !== id || settled) return;\n` +
 				`    if (detail.type === 'xhr-event') {\n` +
+				`      const response = __US_restoreXhrResponse(detail.response);\n` +
 				`      const cb = callbacks[detail.handler];\n` +
-				`      if (typeof cb === 'function') cb(__US_restoreXhrResponse(detail.response));\n` +
-				`      if (__US_terminalXhrHandlers.has(detail.handler)) document.removeEventListener(__US_RESPONSE_EVENT__, onResponse);\n` +
+				`      if (typeof cb === 'function') cb(response);\n` +
+				`      if (__US_terminalXhrHandlers.has(detail.handler)) { settled = true; cleanup(); }\n` +
 				`      return;\n` +
 				`    }\n` +
 				`    if (detail.type === 'error') {\n` +
-				`      document.removeEventListener(__US_RESPONSE_EVENT__, onResponse);\n` +
-				`      if (typeof callbacks.onerror === 'function') callbacks.onerror({ error: detail.error });\n` +
+				`      fail(detail.error || 'Userscripts grant bridge error');\n` +
 				`    }\n` +
 				`  };\n` +
 				`  document.addEventListener(__US_RESPONSE_EVENT__, onResponse);\n` +
 				`  (async () => {\n` +
 				`    try {\n` +
 				`      if ('data' in payload) payload.data = await __US_serializeBridgeRequestData(payload.data);\n` +
-				`      if (requestCancelled) return;\n` +
+				`      if (requestCancelled) { cleanup(); return; }\n` +
+				`      const requestedTimeout = Number(payload.timeout);\n` +
+				`      const bridgeTimeout = Number.isFinite(requestedTimeout) && requestedTimeout > 0 ? Math.max(__US_BRIDGE_CALL_TIMEOUT_MS, requestedTimeout + __US_XHR_TIMEOUT_GRACE_MS) : __US_BRIDGE_CALL_TIMEOUT_MS;\n` +
+				`      timeoutId = setTimeout(() => fail(new Error('Userscripts grant bridge timeout')), bridgeTimeout);\n` +
 				`      requestStarted = true;\n` +
 				`      document.dispatchEvent(new CustomEvent(__US_REQUEST_EVENT__, { detail: { bridgeId: __US_BRIDGE_ID__, id, method: 'GM_xmlhttpRequest', args: [payload] } }));\n` +
 				`    } catch (error) {\n` +
-				`      document.removeEventListener(__US_RESPONSE_EVENT__, onResponse);\n` +
-				`      const errorObj = { error: String(error?.message || error) };\n` +
-				`      if (typeof callbacks.onerror === 'function') callbacks.onerror(errorObj);\n` +
-				`      if (typeof callbacks.onloadend === 'function') callbacks.onloadend(errorObj);\n` +
+				`      fail(error);\n` +
 				`    }\n` +
 				`  })();\n` +
-				`  return { abort() { document.removeEventListener(__US_RESPONSE_EVENT__, onResponse); if (!requestStarted) { requestCancelled = true; return; } document.dispatchEvent(new CustomEvent(__US_ABORT_EVENT__, { detail: { bridgeId: __US_BRIDGE_ID__, id } })); } };\n` +
+				`  return { abort() { requestCancelled = true; cleanup(); if (!requestStarted) { return; } document.dispatchEvent(new CustomEvent(__US_ABORT_EVENT__, { detail: { bridgeId: __US_BRIDGE_ID__, id } })); } };\n` +
 				`}\n` +
 				`GM.xmlHttpRequest = (details) => new Promise((resolve, reject) => {\n` +
-				`  GM_xmlhttpRequest({ ...(details || {}), onloadend: resolve, onerror: reject, ontimeout: reject, onabort: reject });\n` +
+				`  GM_xmlhttpRequest({ ...(details || {}), onload: resolve, onerror: reject, ontimeout: reject, onabort: reject });\n` +
 				`});\n` +
 				`GM.xmlhttpRequest = GM.xmlHttpRequest;\n`
 			: "") +
@@ -774,7 +965,18 @@ async function injection() {
 		const userscript = scripts[i];
 		const filename = userscript.scriptObject.filename;
 		const grants = userscript.scriptObject.grant;
+		const connect = userscript.scriptObject.connect;
+		const hasConnectMetadata = Object.prototype.hasOwnProperty.call(
+			userscript.scriptObject,
+			"connect",
+		);
 		const injectInto = userscript.scriptObject["inject-into"];
+		const xhrContext = {
+			US_filename: filename,
+			US_connect: connect,
+			US_hasConnectMetadata: hasConnectMetadata,
+			US_pageOrigin: globalThis.location?.origin || "",
+		};
 		// create GM.info object, all userscripts get access to GM.info
 		userscript.apis = { GM: {} };
 		userscript.apis.GM.info = {
@@ -819,8 +1021,13 @@ async function injection() {
 						US_filename: filename,
 					});
 					break;
+				case "xmlHttpRequest":
 				case "GM_xmlhttpRequest":
-					userscript.apis[method] = USAPI[method];
+					if (method === "xmlHttpRequest") {
+						userscript.apis.GM[method] = USAPI[method].bind(xhrContext);
+					} else {
+						userscript.apis[method] = USAPI[method].bind(xhrContext);
+					}
 					break;
 				default:
 					userscript.apis.GM[method] = USAPI[method];
@@ -888,4 +1095,5 @@ async function initialize() {
 }
 
 initialize();
+
 
