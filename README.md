@@ -225,6 +225,8 @@ For API type definitions, please refer to: [`types.d.ts`](https://github.com/use
   - functions, DOM nodes, class instances, blobs, streams, and other active objects are rejected
   - reserved object keys such as `__proto__`, `constructor`, and `prototype` are rejected
   - returned values are untrusted page data, not privileged handles
+  - response event names are not a trust boundary; page code can spoof returned data
+  - timeout only rejects the waiting Promise; it cannot interrupt already-running page JavaScript such as an infinite loop
   - use this when a script needs page globals while still keeping `GM_*` APIs in the content-script context
   - returns a [`Promise`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise), resolved with the extractor result if succeeds, rejected with error message if fails
 - `GM.setValue(key, value)`
@@ -400,7 +402,3 @@ Copyright © 2018-2025 Justin Wasack
 
 Licensed under the [GNU General Public License v3.0](/LICENSE) license for all open source applications. A commercial license is required for all other applications.
 
-
-Copyright © 2018-2025 Justin Wasack
-
-Licensed under the [GNU General Public License v3.0](/LICENSE) license for all open source applications. A commercial license is required for all other applications.
