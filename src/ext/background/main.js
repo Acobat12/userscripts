@@ -545,10 +545,11 @@ async function handleMessage(message, sender) {
 					}
 				}
 				xhr.send(body);
+				return { status: "fulfilled" };
 			} catch (error) {
 				console.error(error);
+				return { status: "rejected", result: String(error) };
 			}
-			return { status: "fulfilled" };
 		}
 		case "REFRESH_DNR_RULES": {
 			setDNRRulesets();
