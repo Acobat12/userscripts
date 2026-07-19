@@ -329,6 +329,7 @@ export const validGrants = new Set([
 	"GM.info",
 	"GM_info",
 	"GM.addStyle",
+	"GM.getPageData",
 	"GM.openInTab",
 	"GM.closeTab",
 	"GM.setValue",
@@ -513,3 +514,4 @@ export async function contentScriptRegistration(enable) {
 		}
 	}
 }
+
