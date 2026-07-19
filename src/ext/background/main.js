@@ -2,6 +2,194 @@ import { contentScriptRegistration, openExtensionPage } from "@ext/utils.js";
 import * as settingsStorage from "@ext/settings.js";
 import { connectNative, sendNativeMessage } from "@ext/native.js";
 
+const BACKGROUND_XHR_ALLOWED_METHODS = new Set([
+	"GET",
+	"HEAD",
+	"POST",
+	"PUT",
+	"PATCH",
+	"DELETE",
+	"OPTIONS",
+]);
+const BACKGROUND_XHR_ALLOWED_RESPONSE_TYPES = new Set([
+	"",
+	"text",
+	"json",
+	"blob",
+	"arraybuffer",
+	"document",
+]);
+const BACKGROUND_XHR_FORBIDDEN_HEADERS = new Set([
+	"authorization",
+	"connection",
+	"content-length",
+	"cookie",
+	"cookie2",
+	"host",
+	"origin",
+	"proxy-authorization",
+	"proxy-connection",
+	"referer",
+	"www-authenticate",
+]);
+const BACKGROUND_XHR_FORBIDDEN_HEADER_PREFIXES = ["proxy-", "sec-"];
+const BACKGROUND_XHR_MAX_TIMEOUT_MS = 120_000;
+const BACKGROUND_XHR_MAX_HEADER_COUNT = 64;
+const BACKGROUND_XHR_MAX_HEADER_VALUE_LENGTH = 8192;
+const BACKGROUND_XHR_MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
+const BACKGROUND_XHR_HANDLER_NAMES = new Set([
+	"onreadystatechange",
+	"onloadstart",
+	"onprogress",
+	"onabort",
+	"onerror",
+	"onload",
+	"ontimeout",
+	"onloadend",
+]);
+const BACKGROUND_XHR_UPLOAD_HANDLER_NAMES = new Set([
+	"onabort",
+	"onerror",
+	"onload",
+	"onloadend",
+	"onloadstart",
+	"onprogress",
+	"ontimeout",
+]);
+const backgroundTextEncoder =
+	typeof TextEncoder === "function" ? new TextEncoder() : null;
+
+function backgroundByteLength(value) {
+	const text = String(value ?? "");
+	if (backgroundTextEncoder) {
+		return backgroundTextEncoder.encode(text).byteLength;
+	}
+	return text.length * 2;
+}
+
+function sanitizeBackgroundXhrHeaders(input) {
+	const headers = {};
+	if (input == null) return headers;
+	if (typeof input !== "object" || Array.isArray(input)) {
+		throw new Error("Invalid XHR headers");
+	}
+	let headerCount = 0;
+	for (const [rawName, rawValue] of Object.entries(input)) {
+		const name = String(rawName || "").trim().toLowerCase();
+		if (!name) continue;
+		if (!/^[a-z0-9!#$%&'*+.^_`|~-]+$/.test(name)) {
+			throw new Error("Invalid XHR header name");
+		}
+		if (
+			BACKGROUND_XHR_FORBIDDEN_HEADERS.has(name) ||
+			BACKGROUND_XHR_FORBIDDEN_HEADER_PREFIXES.some((prefix) =>
+				name.startsWith(prefix),
+			)
+		) {
+			throw new Error(`Forbidden XHR header: ${name}`);
+		}
+		const value = String(rawValue);
+		if (
+			value.length > BACKGROUND_XHR_MAX_HEADER_VALUE_LENGTH ||
+			/[\r\n]/.test(value)
+		) {
+			throw new Error("Invalid XHR header value");
+		}
+		headerCount += 1;
+		if (headerCount > BACKGROUND_XHR_MAX_HEADER_COUNT) {
+			throw new Error("Too many XHR headers");
+		}
+		headers[name] = value;
+	}
+	return headers;
+}
+
+function sanitizeBackgroundHandlerFlags(input, allowedHandlers) {
+	const handlers = {};
+	if (input == null) return handlers;
+	if (typeof input !== "object" || Array.isArray(input)) {
+		throw new Error("Invalid XHR handler map");
+	}
+	for (const [key, value] of Object.entries(input)) {
+		if (allowedHandlers.has(key) && Boolean(value)) {
+			handlers[key] = true;
+		}
+	}
+	return handlers;
+}
+
+function validateBackgroundXhrDetails(details) {
+	if (details == null || typeof details !== "object" || Array.isArray(details)) {
+		throw new Error("Invalid XHR details");
+	}
+	const method = String(details.method || "GET").toUpperCase();
+	if (!BACKGROUND_XHR_ALLOWED_METHODS.has(method)) {
+		throw new Error("Unsupported XHR method");
+	}
+	const url = new URL(String(details.url || ""));
+	if (!["http:", "https:"].includes(url.protocol)) {
+		throw new Error("Unsupported XHR URL protocol");
+	}
+	const responseType =
+		typeof details.responseType === "string" &&
+		BACKGROUND_XHR_ALLOWED_RESPONSE_TYPES.has(details.responseType)
+			? details.responseType
+			: "";
+	const timeout = Number(details.timeout);
+	return {
+		...details,
+		headers: sanitizeBackgroundXhrHeaders(details.headers),
+		hasHandlers: sanitizeBackgroundHandlerFlags(
+			details.hasHandlers,
+			BACKGROUND_XHR_HANDLER_NAMES,
+		),
+		hasUploadHandlers: sanitizeBackgroundHandlerFlags(
+			details.hasUploadHandlers,
+			BACKGROUND_XHR_UPLOAD_HANDLER_NAMES,
+		),
+		method,
+		overrideMimeType:
+			typeof details.overrideMimeType === "string" ? details.overrideMimeType : "",
+		password: typeof details.password === "string" ? details.password : "",
+		responseType,
+		timeout:
+			Number.isFinite(timeout) && timeout > 0
+				? Math.min(Math.floor(timeout), BACKGROUND_XHR_MAX_TIMEOUT_MS)
+				: 0,
+		url: url.href,
+		user: typeof details.user === "string" ? details.user : "",
+	};
+}
+
+function getBackgroundXhrResponseSize(response) {
+	if (response == null) return 0;
+	if (response instanceof ArrayBuffer) {
+		return response.byteLength;
+	}
+	if (typeof response === "string") {
+		return backgroundByteLength(response);
+	}
+	return 0;
+}
+
+function createBackgroundXhrErrorResponse(xhr, responseType, statusText) {
+	return {
+		contentType:
+			xhr.readyState >= xhr.HEADERS_RECEIVED
+				? xhr.getResponseHeader("Content-Type")
+				: undefined,
+		readyState: xhr.readyState,
+		response: null,
+		responseHeaders:
+			xhr.readyState >= xhr.HEADERS_RECEIVED ? xhr.getAllResponseHeaders() : "",
+		responseType,
+		responseURL: xhr.responseURL,
+		status: xhr.status,
+		statusText,
+		timeout: xhr.timeout,
+	};
+}
+
 // first sorts files by run-at value, then by weight value
 function userscriptSort(a, b) {
 	// map the run-at values to numeric values
@@ -383,7 +571,7 @@ async function handleMessage(message, sender) {
 				});
 				// parse details and set up for xhr instance
 				/** @type {TypeExtMessages.XHRTransportableDetails} */
-				const details = message.details;
+				const details = validateBackgroundXhrDetails(message.details);
 				/** @type {Parameters<XMLHttpRequest["open"]>[0]} */
 				const method = details.method || "GET";
 				/** @type {Parameters<XMLHttpRequest["open"]>[1]} */
@@ -459,12 +647,55 @@ async function handleMessage(message, sender) {
 				xhr.responseType = details.responseType;
 				// record parsed values for subsequent use
 				const responseType = xhr.responseType;
+				const handlers = details.hasHandlers ?? {};
+				let responseLimitTriggered = false;
+				const failOversizedResponse = (reason) => {
+					if (responseLimitTriggered) return true;
+					responseLimitTriggered = true;
+					const errorResponse = createBackgroundXhrErrorResponse(
+						xhr,
+						responseType,
+						reason,
+					);
+					if (handlers.onerror) {
+						port.postMessage({ handler: "onerror", response: errorResponse });
+					}
+					if (handlers.onloadend) {
+						port.postMessage({ handler: "onloadend", response: errorResponse });
+					} else {
+						port.postMessage({ handler: "onloadend" });
+					}
+					try {
+						xhr.abort();
+					} catch {
+						// Ignore abort failures when the request is already closing.
+					}
+					return true;
+				};
 				// avoid unexpected behavior of legacy defaults such as parsing XML
 				if (responseType === "") xhr.responseType = "text";
 				// transfer to content script via arraybuffer and then parse to blob
 				if (responseType === "blob") xhr.responseType = "arraybuffer";
 				// transfer to content script via text and then parse to document
 				if (responseType === "document") xhr.responseType = "text";
+				xhr.addEventListener("readystatechange", () => {
+					if (responseLimitTriggered || xhr.readyState < xhr.HEADERS_RECEIVED) {
+						return;
+					}
+					const contentLength = Number(xhr.getResponseHeader("Content-Length"));
+					if (
+						Number.isFinite(contentLength) &&
+						contentLength > BACKGROUND_XHR_MAX_RESPONSE_BYTES
+					) {
+						failOversizedResponse("XHR response is too large");
+					}
+				});
+				xhr.addEventListener("progress", (event) => {
+					if (responseLimitTriggered) return;
+					if (Number(event.loaded) > BACKGROUND_XHR_MAX_RESPONSE_BYTES) {
+						failOversizedResponse("XHR response is too large");
+					}
+				});
 				// add required listeners and send result back to the content script
 				if (details.hasUploadHandlers) {
 					for (const handler of Object.keys(details.hasUploadHandlers)) {
@@ -480,9 +711,9 @@ async function handleMessage(message, sender) {
 						};
 					}
 				}
-				const handlers = details.hasHandlers ?? {};
 				for (const handler of Object.keys(handlers)) {
 					xhr[handler] = async () => {
+						if (responseLimitTriggered) return;
 						// can not send xhr through postMessage
 						// construct new object to be sent as "response"
 						/** @type {TypeExtMessages.XHRTransportableResponse} */
@@ -513,6 +744,13 @@ async function handleMessage(message, sender) {
 							xhr.response !== null &&
 							handler !== "onprogress"
 						) {
+							if (
+								getBackgroundXhrResponseSize(xhr.response) >
+								BACKGROUND_XHR_MAX_RESPONSE_BYTES
+							) {
+								failOversizedResponse("XHR response is too large");
+								return;
+							}
 							// need to convert arraybuffer data to postMessage
 							if (
 								xhr.responseType === "arraybuffer" &&
