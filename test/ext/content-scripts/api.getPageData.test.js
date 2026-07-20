@@ -556,6 +556,33 @@ test("ignores corrupted getPageData response events until a valid response arriv
 	});
 });
 
+test("ignores invalid getPageData values even when the spoofed response id matches", async () => {
+	await withApi(async ({ api, document }) => {
+		const realDispatch = document.dispatchEvent.bind(document);
+		let injectedInvalidValue = false;
+		document.dispatchEvent = (event) => {
+			if (
+				!injectedInvalidValue &&
+				String(event?.type || "").startsWith("__userscripts_page_data_response_")
+			) {
+				injectedInvalidValue = true;
+				const payload = JSON.parse(event.detail);
+				realDispatch(
+					new CustomEvent(event.type, {
+						detail: `{"id":${JSON.stringify(payload.id)},"ok":true,"value":{"__proto__":{}}}`,
+					}),
+				);
+			}
+			return realDispatch(event);
+		};
+		try {
+			assert.equal(await api.getPageData(() => "real"), "real");
+		} finally {
+			document.dispatchEvent = realDispatch;
+		}
+	});
+});
+
 test("GM.page.call queries text and clicks matched elements", async () => {
 	await withApi(async ({ api, document }) => {
 		const target = appendElement(document.body, "button", {
@@ -725,6 +752,40 @@ test("ignores corrupted GM.page.call response events until a valid response arri
 		try {
 			assert.equal(
 				await api.page.call("dom.queryText", "#corrupt-target"),
+				"real",
+			);
+		} finally {
+			document.dispatchEvent = realDispatch;
+		}
+	});
+});
+
+test("ignores invalid GM.page.call values even when the spoofed response id matches", async () => {
+	await withApi(async ({ api, document }) => {
+		appendElement(document.body, "div", {
+			id: "invalid-spoof-target",
+			textContent: "real",
+		});
+		const realDispatch = document.dispatchEvent.bind(document);
+		let injectedInvalidValue = false;
+		document.dispatchEvent = (event) => {
+			if (
+				!injectedInvalidValue &&
+				String(event?.type || "").startsWith("__userscripts_page_call_response_")
+			) {
+				injectedInvalidValue = true;
+				const payload = JSON.parse(event.detail);
+				realDispatch(
+					new CustomEvent(event.type, {
+						detail: `{"id":${JSON.stringify(payload.id)},"ok":true,"value":{"__proto__":{}}}`,
+					}),
+				);
+			}
+			return realDispatch(event);
+		};
+		try {
+			assert.equal(
+				await api.page.call("dom.queryText", "#invalid-spoof-target"),
 				"real",
 			);
 		} finally {
