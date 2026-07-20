@@ -582,10 +582,16 @@ function runSerializedPageTask({
 				) {
 					return;
 				}
+				let normalizedValue;
+				if (payload.ok === true) {
+					normalizedValue = normalizePageDataSerializableValue(payload.value);
+				} else if (typeof payload.error !== "string") {
+					return;
+				}
 				settled = true;
 				cleanup();
 				if (payload.ok === true) {
-					resolve(normalizePageDataSerializableValue(payload.value));
+					resolve(normalizedValue);
 					return;
 				}
 				reject(new Error(payload?.error || defaultErrorMessage));
