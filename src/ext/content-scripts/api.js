@@ -538,6 +538,7 @@ function runSerializedPageTask({
 	defaultErrorMessage,
 	maxResultBytes,
 	release,
+	requestId,
 	responseEventPrefix,
 	timeoutMessage,
 	timeoutMs,
@@ -567,20 +568,29 @@ function runSerializedPageTask({
 		};
 		const onResponse = (event) => {
 			if (settled || typeof event.detail !== "string") return;
-			settled = true;
-			cleanup();
 			try {
 				if (pageDataByteLength(event.detail) > maxResultBytes) {
-					throw new Error(`${defaultErrorMessage} result is too large`);
+					return;
 				}
 				const payload = JSON.parse(event.detail);
-				if (payload?.ok === true) {
+				if (
+					!payload ||
+					typeof payload !== "object" ||
+					Array.isArray(payload) ||
+					payload.id !== requestId ||
+					typeof payload.ok !== "boolean"
+				) {
+					return;
+				}
+				settled = true;
+				cleanup();
+				if (payload.ok === true) {
 					resolve(normalizePageDataSerializableValue(payload.value));
 					return;
 				}
 				reject(new Error(payload?.error || defaultErrorMessage));
-			} catch (error) {
-				reject(error);
+			} catch {
+				// Ignore malformed or corrupted response events and keep waiting.
 			}
 		};
 		try {
@@ -609,9 +619,10 @@ function runSerializedPageTask({
 	});
 }
 
-function buildPageDataScript(responseEvent, extractorSource, argsJson) {
+function buildPageDataScript(responseEvent, requestId, extractorSource, argsJson) {
 	return `(() => {
 	const __US_RESPONSE_EVENT__ = ${JSON.stringify(responseEvent)};
+	const __US_REQUEST_ID__ = ${JSON.stringify(requestId)};
 	const __US_ARGS__ = ${argsJson};
 	const __US_MAX_DEPTH__ = ${PAGE_DATA_MAX_DEPTH};
 	const __US_MAX_ARRAY_LENGTH__ = ${PAGE_DATA_MAX_ARRAY_LENGTH};
@@ -695,15 +706,20 @@ function buildPageDataScript(responseEvent, extractorSource, argsJson) {
 	const __US_send = (payload) => {
 		let json;
 		try {
-			json = JSON.stringify(payload);
+			json = JSON.stringify({
+				id: __US_REQUEST_ID__,
+				...payload,
+			});
 		} catch (error) {
 			json = JSON.stringify({
+				id: __US_REQUEST_ID__,
 				ok: false,
 				error: String(error?.message || error),
 			});
 		}
 		if (__US_byteLength(json) > __US_MAX_RESULT_BYTES__) {
 			json = JSON.stringify({
+				id: __US_REQUEST_ID__,
 				ok: false,
 				error: "Page data result is too large",
 			});
@@ -744,9 +760,10 @@ function buildPageDataScript(responseEvent, extractorSource, argsJson) {
 })();`;
 }
 
-function buildPageCallScript(responseEvent, operation, argsJson) {
+function buildPageCallScript(responseEvent, requestId, operation, argsJson) {
 	return `(() => {
 	const __US_RESPONSE_EVENT__ = ${JSON.stringify(responseEvent)};
+	const __US_REQUEST_ID__ = ${JSON.stringify(requestId)};
 	const __US_OPERATION__ = ${JSON.stringify(operation)};
 	const __US_ARGS__ = ${argsJson};
 	const __US_MAX_DEPTH__ = ${PAGE_DATA_MAX_DEPTH};
@@ -831,15 +848,20 @@ function buildPageCallScript(responseEvent, operation, argsJson) {
 	const __US_send = (payload) => {
 		let json;
 		try {
-			json = JSON.stringify(payload);
+			json = JSON.stringify({
+				id: __US_REQUEST_ID__,
+				...payload,
+			});
 		} catch (error) {
 			json = JSON.stringify({
+				id: __US_REQUEST_ID__,
 				ok: false,
 				error: String(error?.message || error),
 			});
 		}
 		if (__US_byteLength(json) > __US_MAX_RESULT_BYTES__) {
 			json = JSON.stringify({
+				id: __US_REQUEST_ID__,
 				ok: false,
 				error: "page.call result is too large",
 			});
@@ -999,12 +1021,14 @@ async function getPageData(extractor, ...args) {
 	} catch (error) {
 		return Promise.reject(error);
 	}
+	const requestId = randomRequestId();
 	return runSerializedPageTask({
 		buildScript: (responseEvent) =>
-			buildPageDataScript(responseEvent, extractorSource, argsJson),
+			buildPageDataScript(responseEvent, requestId, extractorSource, argsJson),
 		defaultErrorMessage: "getPageData failed",
 		maxResultBytes: PAGE_DATA_MAX_RESULT_BYTES,
 		release: releasePageDataCall,
+		requestId,
 		responseEventPrefix: "page_data_response",
 		timeoutMessage: "getPageData timed out",
 		timeoutMs: PAGE_DATA_TIMEOUT_MS,
@@ -1034,16 +1058,19 @@ async function pageCall(operation, ...args) {
 	} catch (error) {
 		return Promise.reject(error);
 	}
+	const requestId = randomRequestId();
 	return runSerializedPageTask({
 		buildScript: (responseEvent) =>
 			buildPageCallScript(
 				responseEvent,
+				requestId,
 				normalizedOperation,
 				argsJson,
 			),
 		defaultErrorMessage: "page.call failed",
 		maxResultBytes: PAGE_CALL_MAX_RESULT_BYTES,
 		release: releasePageCall,
+		requestId,
 		responseEventPrefix: "page_call_response",
 		timeoutMessage: "page.call timed out",
 		timeoutMs: PAGE_CALL_TIMEOUT_MS,
