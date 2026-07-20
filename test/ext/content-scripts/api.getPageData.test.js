@@ -497,19 +497,29 @@ test("enforces a per-second rate limit", async () => {
 
 test("treats spoofed response events as untrusted page data", async () => {
 	await withApi(async ({ api, document }) => {
-		const pending = api.getPageData(
-			() =>
-				new Promise(() => {
-					// Keep the real extractor pending so the test controls the response.
-				}),
-		);
-		const responseEvent = [...document._listeners.keys()].find((type) =>
-			type.startsWith("__userscripts_page_data_response_"),
-		);
-		assert.ok(responseEvent);
+		const realDispatch = document.dispatchEvent.bind(document);
+		let swallowedResponseEvent = null;
+		let swallowedResponseDetail = null;
+		document.dispatchEvent = (event) => {
+			if (String(event?.type || "").startsWith("__userscripts_page_data_response_")) {
+				swallowedResponseEvent = event.type;
+				swallowedResponseDetail = event.detail;
+				return true;
+			}
+			return realDispatch(event);
+		};
+		const pending = api.getPageData(() => ({
+			userId: "real",
+		}));
+		await Promise.resolve();
+		assert.ok(swallowedResponseEvent);
+		assert.equal(typeof swallowedResponseDetail, "string");
+		const capturedPayload = JSON.parse(swallowedResponseDetail);
+		document.dispatchEvent = realDispatch;
 		document.dispatchEvent(
-			new CustomEvent(responseEvent, {
+			new CustomEvent(swallowedResponseEvent, {
 				detail: JSON.stringify({
+					id: capturedPayload.id,
 					ok: true,
 					value: {
 						userId: "spoofed",
@@ -521,6 +531,28 @@ test("treats spoofed response events as untrusted page data", async () => {
 		assert.equal(Object.getPrototypeOf(result), null);
 		assert.equal(result.userId, "spoofed");
 		assert.equal(document.body.childNodes.length, 0);
+	});
+});
+
+test("ignores corrupted getPageData response events until a valid response arrives", async () => {
+	await withApi(async ({ api, document }) => {
+		const realDispatch = document.dispatchEvent.bind(document);
+		let injectedCorruption = false;
+		document.dispatchEvent = (event) => {
+			if (
+				!injectedCorruption &&
+				String(event?.type || "").startsWith("__userscripts_page_data_response_")
+			) {
+				injectedCorruption = true;
+				realDispatch(new CustomEvent(event.type, { detail: "{" }));
+			}
+			return realDispatch(event);
+		};
+		try {
+			assert.equal(await api.getPageData(() => "real"), "real");
+		} finally {
+			document.dispatchEvent = realDispatch;
+		}
 	});
 });
 
@@ -644,9 +676,11 @@ test("GM.page.call treats spoofed response events as untrusted page data", async
 		});
 		const realDispatch = document.dispatchEvent.bind(document);
 		let swallowedResponseEvent = null;
+		let swallowedResponseDetail = null;
 		document.dispatchEvent = (event) => {
 			if (String(event?.type || "").startsWith("__userscripts_page_call_response_")) {
 				swallowedResponseEvent = event.type;
+				swallowedResponseDetail = event.detail;
 				return true;
 			}
 			return realDispatch(event);
@@ -654,15 +688,47 @@ test("GM.page.call treats spoofed response events as untrusted page data", async
 		const pending = api.page.call("dom.queryText", "#spoof-target");
 		await Promise.resolve();
 		assert.ok(swallowedResponseEvent);
+		assert.equal(typeof swallowedResponseDetail, "string");
+		const capturedPayload = JSON.parse(swallowedResponseDetail);
 		document.dispatchEvent = realDispatch;
 		document.dispatchEvent(
 			new CustomEvent(swallowedResponseEvent, {
 				detail: JSON.stringify({
+					id: capturedPayload.id,
 					ok: true,
 					value: "spoofed",
 				}),
 			}),
 		);
 		assert.equal(await pending, "spoofed");
+	});
+});
+
+test("ignores corrupted GM.page.call response events until a valid response arrives", async () => {
+	await withApi(async ({ api, document }) => {
+		appendElement(document.body, "div", {
+			id: "corrupt-target",
+			textContent: "real",
+		});
+		const realDispatch = document.dispatchEvent.bind(document);
+		let injectedCorruption = false;
+		document.dispatchEvent = (event) => {
+			if (
+				!injectedCorruption &&
+				String(event?.type || "").startsWith("__userscripts_page_call_response_")
+			) {
+				injectedCorruption = true;
+				realDispatch(new CustomEvent(event.type, { detail: "{" }));
+			}
+			return realDispatch(event);
+		};
+		try {
+			assert.equal(
+				await api.page.call("dom.queryText", "#corrupt-target"),
+				"real",
+			);
+		} finally {
+			document.dispatchEvent = realDispatch;
+		}
 	});
 });
