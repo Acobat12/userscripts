@@ -25,7 +25,7 @@ jobs:
             git tag v4.8.6
           fi
 
-      - run: npm run build:mac-safari-15
+      - run: npm run build:mac-safari-16.4
 
       - run: |
           xcodebuild \
