@@ -17,6 +17,10 @@ function randomLabel() {
 	return a[Math.floor(r * a.length)] + r.toString().slice(5, 6);
 }
 
+function normalizeInjectInto(value) {
+	return value === "page" || value === "content" ? value : "auto";
+}
+
 function triageJS(userscript) {
 	const runAt = userscript.scriptObject["run-at"];
 	if (runAt === "document-start") {
@@ -59,7 +63,7 @@ ${userscript.code}
 		console.error(\`${filename.replaceAll("`", "\\`")}\`, error);
 	}
 })(); //# sourceURL=${filename.replace(/[\s"']/g, "-") + usTag}`;
-	let injectInto = userscript.scriptObject["inject-into"];
+	let injectInto = normalizeInjectInto(userscript.scriptObject["inject-into"]);
 	if (userscript.forceContentInjection) {
 		injectInto = "content";
 	}
@@ -68,7 +72,7 @@ ${userscript.code}
 		injectInto = "content";
 		console.warn(`Attempting fallback injection for ${name}`);
 	}
-	const world = injectInto === "content" ? "content" : "page";
+	const world = injectInto === "page" ? "page" : "content";
 	if (window.self === window.top) {
 		console.info(`Injecting: ${name} %c(js/${world})`, colors.yellow);
 	} else {
@@ -173,7 +177,10 @@ async function injection() {
 			userscript.scriptObject,
 			"connect",
 		);
-		const injectInto = userscript.scriptObject["inject-into"];
+		const injectInto = normalizeInjectInto(
+			userscript.scriptObject["inject-into"],
+		);
+		userscript.scriptObject["inject-into"] = injectInto;
 		const xhrContext = {
 			US_filename: filename,
 			US_connect: connect,
@@ -194,10 +201,10 @@ async function injection() {
 		userscript.apis.GM_info = userscript.apis.GM.info;
 		// if @grant explicitly set to none, empty grants array
 		if (grants.includes("none")) grants.length = 0;
-		if (grants.length && (injectInto === "page" || injectInto === "auto")) {
+		if (grants.length > 0 && injectInto !== "content") {
 			userscript.forceContentInjection = true;
 			console.warn(
-				`${filename} requested @inject-into ${injectInto} with @grant values; forcing content injection. Use GM.getPageData() for page-context data access.`,
+				`${filename} has @grant values; forcing content injection. Use GM.getPageData() for page-context data access.`,
 			);
 		}
 		// loop through each userscript @grant value, add methods as needed
