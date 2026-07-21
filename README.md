@@ -222,10 +222,13 @@ For API type definitions, please refer to: [`types.d.ts`](https://github.com/use
   - `extractor: Function`
   - `args: Any[]` - optional, must be JSON-serializable
   - runs the provided extractor function in the page context and returns only plain JSON-serializable data
+  - on platforms that support `browser.scripting.executeScript({ world: "MAIN" })`, the result is returned through the browser API instead of a DOM event bridge
+  - on older or unsupported platforms, it falls back to the compatibility page-script bridge
   - functions, DOM nodes, class instances, blobs, streams, and other active objects are rejected
   - reserved object keys such as `__proto__`, `constructor`, and `prototype` are rejected
   - returned values are untrusted page data, not privileged handles
-  - response event names are not a trust boundary; page code can spoof returned data
+  - browser-mediated transport hardens the return path, but the result is still page-controlled because `MAIN` world code shares the page environment
+  - response event names are not a trust boundary in the compatibility fallback; page code can spoof returned data
   - timeout only rejects the waiting Promise; it cannot interrupt already-running page JavaScript such as an infinite loop
   - use this when a script needs page globals while still keeping `GM_*` APIs in the content-script context
   - preferred for **reading** page state
@@ -270,12 +273,14 @@ const text = await GM.getPageData(
 - `GM.page.call(operation, ...args)`
   - requires `@grant GM.page` or `@grant GM.page.call`
   - runs a narrow allowlisted page-world operation and returns only plain JSON-serializable data
+  - on platforms that support `browser.scripting.executeScript({ world: "MAIN" })`, the result is returned through the browser API instead of a DOM event bridge
+  - on older or unsupported platforms, it falls back to the compatibility page-script bridge
   - this is not `unsafeWindow`; it does not expose page object references or arbitrary evaluation
   - currently supported operations:
   - `GM.page.call("dom.queryText", selector)` - returns the first matched element's `textContent` or `null`
   - `GM.page.call("dom.click", selector)` - clicks the first matched element and returns `true` if found
   - `GM.page.call("event.dispatch", selector, eventSpec)` - dispatches an allowlisted `Event`, `CustomEvent`, `MouseEvent`, `KeyboardEvent`, or `InputEvent`
-  - results remain untrusted page-controlled data, and response events are not a trust boundary
+  - results remain untrusted page-controlled data, and fallback response events are not a trust boundary
   - preferred for **small, explicit interactions** with page DOM when `GM.getPageData()` is not enough
   - typical grants:
 
