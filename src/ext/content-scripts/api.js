@@ -160,6 +160,7 @@ const pageDataCallTimes = [];
 let pageDataActiveCalls = 0;
 const pageCallTimes = [];
 let pageCallActiveCalls = 0;
+let pageTaskBackgroundTransportState = "unknown";
 
 function randomRequestId() {
 	if (typeof globalThis.crypto?.randomUUID === "function") {
@@ -248,6 +249,153 @@ function reservePageCall() {
 			pageCallActiveCalls -= 1;
 		}
 	};
+}
+
+function createSingleUseCallback(callback) {
+	let current =
+		typeof callback === "function"
+			? callback
+			: null;
+	return () => {
+		if (!current) return;
+		const callbackToRun = current;
+		current = null;
+		callbackToRun();
+	};
+}
+
+async function tryRunPageTaskViaBackground(
+	task,
+	{ defaultErrorMessage, maxResultBytes, oversizedResultMessage },
+) {
+	if (pageTaskBackgroundTransportState === "unsupported") {
+		return { status: "fallback" };
+	}
+	const runtime = globalThis.browser?.runtime;
+	if (typeof runtime?.sendMessage !== "function") {
+		pageTaskBackgroundTransportState = "unsupported";
+		return { status: "fallback" };
+	}
+	let response;
+	try {
+		response = await runtime.sendMessage({
+			name: "API_PAGE_EXECUTE",
+			task,
+		});
+	} catch {
+		return { status: "fallback" };
+	}
+	if (
+		!response ||
+		typeof response !== "object" ||
+		Array.isArray(response)
+	) {
+		return { status: "fallback" };
+	}
+	if (response.status === "rejected") {
+		if (response.result?.transportUnavailable === true) {
+			pageTaskBackgroundTransportState = "unsupported";
+			return { status: "fallback" };
+		}
+		return {
+			status: "error",
+			error: String(
+				response.result?.message ||
+					response.result?.error ||
+					response.result ||
+					defaultErrorMessage,
+			),
+		};
+	}
+	if (response.status !== "fulfilled") {
+		return { status: "fallback" };
+	}
+	const result = response.result;
+	if (
+		!result ||
+		typeof result !== "object" ||
+		Array.isArray(result)
+	) {
+		return { status: "fallback" };
+	}
+	if (result.transportUnavailable === true) {
+		pageTaskBackgroundTransportState = "unsupported";
+		return { status: "fallback" };
+	}
+	if (result.transport === "scripting.executeScript") {
+		pageTaskBackgroundTransportState = "supported";
+	}
+	if (result.ok !== true) {
+		return {
+			status: "error",
+			error:
+				typeof result.error === "string" && result.error
+					? result.error
+					: defaultErrorMessage,
+		};
+	}
+	try {
+		const normalizedValue = normalizePageDataSerializableValue(result.value);
+		const normalizedJson = JSON.stringify(normalizedValue);
+		if (pageDataByteLength(normalizedJson) > maxResultBytes) {
+			return {
+				status: "error",
+				error: oversizedResultMessage,
+			};
+		}
+		return {
+			status: "fulfilled",
+			value: normalizedValue,
+		};
+	} catch (error) {
+		return {
+			status: "error",
+			error: String(error?.message || error || defaultErrorMessage),
+		};
+	}
+}
+
+async function runPageTaskWithPreferredTransport({
+	backgroundTask,
+	buildScript,
+	defaultErrorMessage,
+	maxResultBytes,
+	oversizedResultMessage,
+	release,
+	requestId,
+	responseEventPrefix,
+	timeoutMessage,
+	timeoutMs,
+}) {
+	const releaseOnce = createSingleUseCallback(release);
+	try {
+		const backgroundResult = await tryRunPageTaskViaBackground(backgroundTask, {
+			defaultErrorMessage,
+			maxResultBytes,
+			oversizedResultMessage,
+		});
+		if (backgroundResult.status === "fulfilled") {
+			releaseOnce();
+			return backgroundResult.value;
+		}
+		if (backgroundResult.status === "error") {
+			releaseOnce();
+			throw new Error(backgroundResult.error || defaultErrorMessage);
+		}
+		return await runSerializedPageTask({
+			buildScript,
+			defaultErrorMessage,
+			maxResultBytes,
+			release: releaseOnce,
+			requestId,
+			responseEventPrefix,
+			timeoutMessage,
+			timeoutMs,
+		});
+	} catch (error) {
+		releaseOnce();
+		throw error;
+	}
 }
 
 function normalizePageDataSerializableValue(
@@ -1028,11 +1176,17 @@ async function getPageData(extractor, ...args) {
 		return Promise.reject(error);
 	}
 	const requestId = randomRequestId();
-	return runSerializedPageTask({
+	return runPageTaskWithPreferredTransport({
+		backgroundTask: {
+			kind: "getPageData",
+			extractorSource,
+			argsJson,
+		},
 		buildScript: (responseEvent) =>
 			buildPageDataScript(responseEvent, requestId, extractorSource, argsJson),
 		defaultErrorMessage: "getPageData failed",
 		maxResultBytes: PAGE_DATA_MAX_RESULT_BYTES,
+		oversizedResultMessage: "Page data result is too large",
 		release: releasePageDataCall,
 		requestId,
 		responseEventPrefix: "page_data_response",
@@ -1065,7 +1219,12 @@ async function pageCall(operation, ...args) {
 		return Promise.reject(error);
 	}
 	const requestId = randomRequestId();
-	return runSerializedPageTask({
+	return runPageTaskWithPreferredTransport({
+		backgroundTask: {
+			kind: "pageCall",
+			operation: normalizedOperation,
+			argsJson,
+		},
 		buildScript: (responseEvent) =>
 			buildPageCallScript(
 				responseEvent,
@@ -1075,6 +1234,7 @@ async function pageCall(operation, ...args) {
 			),
 		defaultErrorMessage: "page.call failed",
 		maxResultBytes: PAGE_CALL_MAX_RESULT_BYTES,
+		oversizedResultMessage: "page.call result is too large",
 		release: releasePageCall,
 		requestId,
 		responseEventPrefix: "page_call_response",
