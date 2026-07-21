@@ -222,13 +222,125 @@ For API type definitions, please refer to: [`types.d.ts`](https://github.com/use
   - `extractor: Function`
   - `args: Any[]` - optional, must be JSON-serializable
   - runs the provided extractor function in the page context and returns only plain JSON-serializable data
+  - requires browser-mediated execution through `browser.scripting.executeScript({ world: "MAIN" })`
   - functions, DOM nodes, class instances, blobs, streams, and other active objects are rejected
   - reserved object keys such as `__proto__`, `constructor`, and `prototype` are rejected
   - returned values are untrusted page data, not privileged handles
-  - response event names are not a trust boundary; page code can spoof returned data
+  - browser-mediated transport hardens the return path, but the result is still page-controlled because `MAIN` world code shares the page environment
   - timeout only rejects the waiting Promise; it cannot interrupt already-running page JavaScript such as an infinite loop
   - use this when a script needs page globals while still keeping `GM_*` APIs in the content-script context
+  - preferred for **reading** page state
+  - typical grants:
+
+```js
+// @grant GM.getPageData
+```
+
+```js
+const state = await GM.getPageData(() => ({
+  userId: window.app?.user?.id ?? null,
+  tokenPresent: Boolean(window.app?.token),
+  title: document.title,
+}));
+
+if (
+  !state ||
+  typeof state !== "object" ||
+  typeof state.userId !== "string"
+) {
+  throw new Error("Invalid page data");
+}
+```
+
+```js
+const text = await GM.getPageData(
+  (selector) => document.querySelector(selector)?.textContent ?? null,
+  "#status",
+);
+```
+
+  - recommended:
+    - keep the extractor small and self-contained
+    - return only the fields you actually need
+    - validate the returned shape before using it
+  - do not:
+    - return DOM nodes, functions, promises that never settle, or large object graphs
+    - assume the returned data is trustworthy just because it came from your own extractor
+    - use an infinite loop or long-running extractor and expect timeout to stop it
   - returns a [`Promise`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise), resolved with the extractor result if succeeds, rejected with error message if fails
+- `GM.page.call(operation, ...args)`
+  - requires `@grant GM.page` or `@grant GM.page.call`
+  - runs a narrow allowlisted page-world operation and returns only plain JSON-serializable data
+  - requires browser-mediated execution through `browser.scripting.executeScript({ world: "MAIN" })`
+  - this is not `unsafeWindow`; it does not expose page object references or arbitrary evaluation
+  - currently supported operations:
+  - `GM.page.call("dom.queryText", selector)` - returns the first matched element's `textContent` or `null`
+  - `GM.page.call("dom.click", selector)` - clicks the first matched element and returns `true` if found
+  - `GM.page.call("event.dispatch", selector, eventSpec)` - dispatches an allowlisted `Event`, `CustomEvent`, `MouseEvent`, `KeyboardEvent`, or `InputEvent`
+  - results remain untrusted page-controlled data
+  - preferred for **small, explicit interactions** with page DOM when `GM.getPageData()` is not enough
+  - typical grants:
+
+```js
+// @grant GM.page
+// or
+// @grant GM.page.call
+```
+
+```js
+const label = await GM.page.call("dom.queryText", ".profile-name");
+if (typeof label === "string") {
+  console.log("Profile:", label.trim());
+}
+```
+
+```js
+const clicked = await GM.page.call("dom.click", "button.submit");
+if (!clicked) {
+  console.warn("Submit button not found");
+}
+```
+
+```js
+await GM.page.call("event.dispatch", "input.search", {
+  kind: "input",
+  type: "input",
+  bubbles: true,
+  composed: true,
+  data: "hello",
+  inputType: "insertText",
+});
+```
+
+```js
+await GM.page.call("event.dispatch", "#app", {
+  kind: "custom",
+  type: "userscripts:ready",
+  bubbles: true,
+  detail: { source: "userscript" },
+});
+```
+
+  - recommended:
+    - use `GM.page.call(...)` only for a small allowlisted action
+    - prefer stable selectors that you control or validate carefully
+    - check boolean and nullable results explicitly
+  - do not:
+    - treat this API like generic page evaluation
+    - build a higher-level `eval` or arbitrary method-call layer on top of it
+    - pass unvalidated user input directly into selectors or event payloads
+    - assume that a dispatched event guarantees the page accepted or processed it
+  - returns a [`Promise`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise), resolved with the operation result if succeeds, rejected with error message if fails
+
+#### Safe Page Access Guidance
+
+- Prefer `GM.getPageData()` when you only need to **read** page state.
+- Prefer `GM.page.call(...)` when you need one small DOM interaction such as reading text, clicking, or dispatching a simple event.
+- Do **not** use either API as a substitute for `unsafeWindow`.
+- Treat all returned values as **page-controlled input**. Validate them before using them in privileged logic.
+- Keep selectors narrow and predictable. Broad selectors such as `"div"` or `"*"` are brittle and easy to misuse.
+- Avoid extracting secrets or sensitive account state unless the userscript truly needs them.
+- Avoid tight polling loops. Repeated page access can still be expensive even with built-in rate limits.
 - `GM.setValue(key, value)`
   - `key: String`
   - `value: Any` - any can be JSON-serialized
@@ -401,4 +513,3 @@ Userscripts does not collect any data from its users nor monitor activities or a
 Copyright © 2018-2025 Justin Wasack
 
 Licensed under the [GNU General Public License v3.0](/LICENSE) license for all open source applications. A commercial license is required for all other applications.
-

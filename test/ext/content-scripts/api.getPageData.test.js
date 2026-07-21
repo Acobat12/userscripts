@@ -8,16 +8,66 @@ const apiModuleUrl = new URL(
 ).href;
 
 class FakeEvent {
-	constructor(type) {
+	constructor(type, init = {}) {
 		this.type = String(type);
 		this.target = null;
+		this.currentTarget = null;
+		this.bubbles = Boolean(init.bubbles);
+		this.cancelable = Boolean(init.cancelable);
+		this.composed = Boolean(init.composed);
+		this.defaultPrevented = false;
+	}
+
+	preventDefault() {
+		if (this.cancelable) {
+			this.defaultPrevented = true;
+		}
 	}
 }
 
 class FakeCustomEvent extends FakeEvent {
 	constructor(type, init = {}) {
-		super(type);
+		super(type, init);
 		this.detail = init.detail;
+	}
+}
+
+class FakeMouseEvent extends FakeEvent {
+	constructor(type, init = {}) {
+		super(type, init);
+		this.button = init.button ?? 0;
+		this.buttons = init.buttons ?? 0;
+		this.clientX = init.clientX ?? 0;
+		this.clientY = init.clientY ?? 0;
+		this.screenX = init.screenX ?? 0;
+		this.screenY = init.screenY ?? 0;
+		this.ctrlKey = Boolean(init.ctrlKey);
+		this.shiftKey = Boolean(init.shiftKey);
+		this.altKey = Boolean(init.altKey);
+		this.metaKey = Boolean(init.metaKey);
+	}
+}
+
+class FakeKeyboardEvent extends FakeEvent {
+	constructor(type, init = {}) {
+		super(type, init);
+		this.key = init.key ?? "";
+		this.code = init.code ?? "";
+		this.location = init.location ?? 0;
+		this.repeat = Boolean(init.repeat);
+		this.ctrlKey = Boolean(init.ctrlKey);
+		this.shiftKey = Boolean(init.shiftKey);
+		this.altKey = Boolean(init.altKey);
+		this.metaKey = Boolean(init.metaKey);
+	}
+}
+
+class FakeInputEvent extends FakeEvent {
+	constructor(type, init = {}) {
+		super(type, init);
+		this.data = init.data ?? null;
+		this.inputType = init.inputType ?? "";
+		this.isComposing = Boolean(init.isComposing);
 	}
 }
 
@@ -59,9 +109,11 @@ class FakeEventTarget {
 			if (entry.once) {
 				this.removeEventListener(event.type, entry.listener);
 			}
+			event.currentTarget = this;
 			entry.listener.call(this, event);
 		}
-		return true;
+		event.currentTarget = null;
+		return !event.defaultPrevented;
 	}
 }
 
@@ -129,6 +181,9 @@ class FakeElement extends FakeNode {
 		this.style = {};
 		this.textContent = "";
 		this.shadowRoot = null;
+		this.id = "";
+		this.className = "";
+		this._attributes = Object.create(null);
 	}
 
 	attachShadow() {
@@ -141,6 +196,28 @@ class FakeElement extends FakeNode {
 		if (this.parentNode) {
 			this.parentNode.removeChild(this);
 		}
+	}
+
+	click() {
+		return this.dispatchEvent(
+			new FakeMouseEvent("click", {
+				bubbles: true,
+				cancelable: true,
+				composed: true,
+			}),
+		);
+	}
+
+	setAttribute(name, value) {
+		const normalizedName = String(name);
+		const normalizedValue = String(value);
+		this._attributes[normalizedName] = normalizedValue;
+		if (normalizedName === "id") this.id = normalizedValue;
+		if (normalizedName === "class") this.className = normalizedValue;
+	}
+
+	querySelector(selector) {
+		return querySelectorFrom(this, selector);
 	}
 }
 
@@ -170,6 +247,10 @@ class FakeDocument extends FakeNode {
 	createElement(tagName) {
 		return new FakeElement(this, tagName);
 	}
+
+	querySelector(selector) {
+		return querySelectorFrom(this, selector);
+	}
 }
 
 class FakeWindow {
@@ -180,7 +261,7 @@ class FakeWindow {
 	}
 }
 
-function installFakeDom() {
+function installFakeDom(extraGlobals = {}) {
 	const previousGlobals = new Map();
 	const document = new FakeDocument();
 	const window = new FakeWindow(document);
@@ -189,6 +270,9 @@ function installFakeDom() {
 	const globalAssignments = {
 		Event: FakeEvent,
 		CustomEvent: FakeCustomEvent,
+		MouseEvent: FakeMouseEvent,
+		KeyboardEvent: FakeKeyboardEvent,
+		InputEvent: FakeInputEvent,
 		EventTarget: FakeEventTarget,
 		Node: FakeNode,
 		Element: FakeElement,
@@ -197,6 +281,8 @@ function installFakeDom() {
 		window,
 		location,
 		app: undefined,
+		browser: createDefaultBrowserMock(),
+		...extraGlobals,
 	};
 	for (const [key, value] of Object.entries(globalAssignments)) {
 		previousGlobals.set(
@@ -222,14 +308,206 @@ function installFakeDom() {
 	};
 }
 
+function matchesSelector(element, selector) {
+	const normalizedSelector = String(selector).trim();
+	if (!normalizedSelector) return false;
+	if (normalizedSelector.startsWith("#")) {
+		return element.id === normalizedSelector.slice(1);
+	}
+	if (normalizedSelector.startsWith(".")) {
+		return element.className
+			.split(/\s+/)
+			.filter(Boolean)
+			.includes(normalizedSelector.slice(1));
+	}
+	return element.tagName === normalizedSelector.toUpperCase();
+}
+
+function querySelectorFrom(root, selector) {
+	const stack = [...root.childNodes];
+	while (stack.length) {
+		const node = stack.shift();
+		if (node instanceof FakeElement && matchesSelector(node, selector)) {
+			return node;
+		}
+		if (node?.childNodes?.length) {
+			stack.unshift(...node.childNodes);
+		}
+	}
+	return null;
+}
+
+function appendElement(parent, tagName, options = {}) {
+	const element = parent.ownerDocument.createElement(tagName);
+	if (options.id) element.setAttribute("id", options.id);
+	if (options.className) element.setAttribute("class", options.className);
+	if (typeof options.textContent === "string") {
+		element.textContent = options.textContent;
+	}
+	parent.appendChild(element);
+	return element;
+}
+
+function buildFakePageEvent(spec) {
+	const init = {
+		bubbles: Boolean(spec?.bubbles),
+		cancelable: Boolean(spec?.cancelable),
+		composed: Boolean(spec?.composed),
+	};
+	switch (spec?.kind) {
+		case "custom":
+			if (Object.prototype.hasOwnProperty.call(spec, "detail")) {
+				init.detail = spec.detail;
+			}
+			return new CustomEvent(spec.type, init);
+		case "mouse":
+			for (const key of [
+				"button",
+				"buttons",
+				"clientX",
+				"clientY",
+				"screenX",
+				"screenY",
+				"ctrlKey",
+				"shiftKey",
+				"altKey",
+				"metaKey",
+			]) {
+				if (Object.prototype.hasOwnProperty.call(spec, key)) {
+					init[key] = spec[key];
+				}
+			}
+			return new MouseEvent(spec.type, init);
+		case "keyboard":
+			for (const key of [
+				"key",
+				"code",
+				"location",
+				"repeat",
+				"ctrlKey",
+				"shiftKey",
+				"altKey",
+				"metaKey",
+			]) {
+				if (Object.prototype.hasOwnProperty.call(spec, key)) {
+					init[key] = spec[key];
+				}
+			}
+			return new KeyboardEvent(spec.type, init);
+		case "input":
+			for (const key of ["data", "inputType", "isComposing"]) {
+				if (Object.prototype.hasOwnProperty.call(spec, key)) {
+					init[key] = spec[key];
+				}
+			}
+			return new InputEvent(spec.type, init);
+		default:
+			return new Event(spec.type, init);
+	}
+}
+
+async function executeFakePageTask(message) {
+	if (message?.name !== "API_PAGE_EXECUTE") {
+		throw new Error(`Unsupported message: ${message?.name}`);
+	}
+	const task = message.task;
+	if (!task || typeof task !== "object" || Array.isArray(task)) {
+		throw new Error("Invalid page task");
+	}
+	if (task.kind === "getPageData") {
+		const extractor = vm.runInThisContext(`(${task.extractorSource})`);
+		const args = JSON.parse(task.argsJson);
+		try {
+			const value = await extractor(...args);
+			return {
+				status: "fulfilled",
+				result: {
+					transport: "scripting.executeScript",
+					ok: true,
+					value,
+				},
+			};
+		} catch (error) {
+			return {
+				status: "fulfilled",
+				result: {
+					transport: "scripting.executeScript",
+					ok: false,
+					error: String(error?.message || error),
+				},
+			};
+		}
+	}
+	if (task.kind === "pageCall") {
+		const args = JSON.parse(task.argsJson);
+		const [selector, spec] = args;
+		const target = document.querySelector(selector);
+		try {
+			let value;
+			switch (task.operation) {
+				case "dom.queryText":
+					value = target ? String(target.textContent ?? "") : null;
+					break;
+				case "dom.click":
+					if (!target) {
+						value = false;
+						break;
+					}
+					target.click();
+					value = true;
+					break;
+				case "event.dispatch":
+					value = target ? target.dispatchEvent(buildFakePageEvent(spec)) : false;
+					break;
+				default:
+					throw new Error("Unsupported page operation");
+			}
+			return {
+				status: "fulfilled",
+				result: {
+					transport: "scripting.executeScript",
+					ok: true,
+					value,
+				},
+			};
+		} catch (error) {
+			return {
+				status: "fulfilled",
+				result: {
+					transport: "scripting.executeScript",
+					ok: false,
+					error: String(error?.message || error),
+				},
+			};
+		}
+	}
+	throw new Error("Unsupported page task");
+}
+
+function createDefaultBrowserMock() {
+	return {
+		runtime: {
+			sendMessage(message) {
+				return executeFakePageTask(message);
+			},
+		},
+	};
+}
+
 async function loadApi() {
 	const uniqueUrl = `${apiModuleUrl}?t=${Date.now()}_${Math.random()}`;
 	const module = await import(uniqueUrl);
 	return module.default;
 }
 
-async function withApi(run) {
-	const dom = installFakeDom();
+async function flushMicrotasks(count = 1) {
+	for (let i = 0; i < count; i++) {
+		await Promise.resolve();
+	}
+}
+
+async function withApi(run, options = {}) {
+	const dom = installFakeDom(options.globals);
 	try {
 		const api = await loadApi();
 		await run({ api, document: dom.document, window: dom.window });
@@ -247,7 +525,7 @@ test("rejects unsupported page-controlled return values", async () => {
 		await assert.rejects(api.getPageData(() => window), /object must be plain/);
 		await assert.rejects(
 			api.getPageData(() => () => 1),
-			/unsupported type/,
+			/not supported|unsupported type/,
 		);
 		await assert.rejects(
 			api.getPageData(() => Infinity),
@@ -289,7 +567,7 @@ test("rejects oversized extractors, arguments, and results", async () => {
 	});
 });
 
-test("supports async extractors and removes injected DOM after completion", async () => {
+test("supports async extractors without injecting bridge DOM", async () => {
 	await withApi(async ({ api, document, window }) => {
 		window.app = {
 			token: "token-123",
@@ -308,7 +586,8 @@ test("supports async extractors and removes injected DOM after completion", asyn
 					}, 0);
 				}),
 		);
-		assert.equal(document.body.childNodes.length, 1);
+		await flushMicrotasks();
+		assert.equal(document.body.childNodes.length, 0);
 		const result = await pending;
 		assert.equal(document.body.childNodes.length, 0);
 		assert.equal(Object.getPrototypeOf(result), null);
@@ -371,31 +650,271 @@ test("enforces a per-second rate limit", async () => {
 	});
 });
 
-test("treats spoofed response events as untrusted page data", async () => {
-	await withApi(async ({ api, document }) => {
-		const pending = api.getPageData(
-			() =>
-				new Promise(() => {
-					// Keep the real extractor pending so the test controls the response.
-				}),
-		);
-		const responseEvent = [...document._listeners.keys()].find((type) =>
-			type.startsWith("__userscripts_page_data_response_"),
-		);
-		assert.ok(responseEvent);
-		document.dispatchEvent(
-			new CustomEvent(responseEvent, {
-				detail: JSON.stringify({
-					ok: true,
-					value: {
-						userId: "spoofed",
+test("uses browser-mediated transport for getPageData when available", async () => {
+	const messages = [];
+	await withApi(
+		async ({ api, document }) => {
+			const result = await api.getPageData(() => ({
+				userId: "page-value",
+			}));
+			assert.equal(messages.length, 1);
+			assert.equal(messages[0].name, "API_PAGE_EXECUTE");
+			assert.equal(messages[0].task.kind, "getPageData");
+			assert.equal(messages[0].task.argsJson, "[]");
+			assert.equal(document.body.childNodes.length, 0);
+			assert.equal(Object.getPrototypeOf(result), null);
+			assert.equal(result.userId, "from-background");
+		},
+		{
+			globals: {
+				browser: {
+					runtime: {
+						async sendMessage(message) {
+							messages.push(message);
+							return {
+								status: "fulfilled",
+								result: {
+									transport: "scripting.executeScript",
+									ok: true,
+									value: {
+										userId: "from-background",
+									},
+								},
+							};
+						},
 					},
-				}),
-			}),
-		);
-		const result = await pending;
-		assert.equal(Object.getPrototypeOf(result), null);
-		assert.equal(result.userId, "spoofed");
-		assert.equal(document.body.childNodes.length, 0);
+				},
+			},
+		},
+	);
+});
+
+test("rejects when browser-mediated transport is unavailable", async () => {
+	await withApi(
+		async ({ api, document }) => {
+			await assert.rejects(
+				api.getPageData(() => "value"),
+				/transport is not available/,
+			);
+			assert.equal(document.body.childNodes.length, 0);
+		},
+		{
+			globals: {
+				browser: {
+					runtime: {
+						async sendMessage() {
+							return {
+								status: "rejected",
+								result: {
+									message: "Page task transport is not available",
+								},
+							};
+						},
+					},
+				},
+			},
+		},
+	);
+});
+
+test("uses browser-mediated transport for GM.page.call when available", async () => {
+	const messages = [];
+	await withApi(
+		async ({ api, document }) => {
+			assert.equal(await api.page.call("dom.queryText", "#target"), "from-background");
+			assert.equal(messages.length, 1);
+			assert.equal(messages[0].name, "API_PAGE_EXECUTE");
+			assert.equal(messages[0].task.kind, "pageCall");
+			assert.equal(messages[0].task.operation, "dom.queryText");
+			assert.equal(messages[0].task.argsJson, '["#target"]');
+			assert.equal(document.body.childNodes.length, 0);
+		},
+		{
+			globals: {
+				browser: {
+					runtime: {
+						async sendMessage(message) {
+							messages.push(message);
+							return {
+								status: "fulfilled",
+								result: {
+									transport: "scripting.executeScript",
+									ok: true,
+									value: "from-background",
+								},
+							};
+						},
+					},
+				},
+			},
+		},
+	);
+});
+
+test("rejects malformed browser-mediated getPageData payloads", async () => {
+	await withApi(
+		async ({ api }) => {
+			await assert.rejects(
+				api.getPageData(() => "real"),
+				/getPageData failed/,
+			);
+		},
+		{
+			globals: {
+				browser: {
+					runtime: {
+						async sendMessage() {
+							return {
+								status: "fulfilled",
+								result: {
+									ok: true,
+									value: "real",
+								},
+							};
+						},
+					},
+				},
+			},
+		},
+	);
+});
+
+test("GM.page.call queries text and clicks matched elements", async () => {
+	await withApi(async ({ api, document }) => {
+		const target = appendElement(document.body, "button", {
+			id: "target",
+			textContent: "Launch",
+		});
+		let clickCount = 0;
+		target.addEventListener("click", () => {
+			clickCount += 1;
+		});
+		const nodeCount = document.body.childNodes.length;
+		assert.equal(await api.page.call("dom.queryText", "#target"), "Launch");
+		assert.equal(document.body.childNodes.length, nodeCount);
+		assert.equal(await api.page.call("dom.click", "#target"), true);
+		assert.equal(clickCount, 1);
+		assert.equal(await api.page.call("dom.click", "#missing"), false);
+		assert.equal(document.body.childNodes.length, nodeCount);
 	});
+});
+
+test("GM.page.call dispatches allowlisted page events", async () => {
+	await withApi(async ({ api, document }) => {
+		const target = appendElement(document.body, "input", {
+			id: "field",
+		});
+		let customDetail = null;
+		target.addEventListener("userscripts:ready", (event) => {
+			customDetail = event.detail;
+			event.preventDefault();
+		});
+		const customResult = await api.page.call("event.dispatch", "#field", {
+			kind: "custom",
+			type: "userscripts:ready",
+			bubbles: true,
+			cancelable: true,
+			detail: {
+				step: 1,
+			},
+		});
+		assert.equal(customResult, false);
+		assert.deepEqual(customDetail, { step: 1 });
+
+		const keyEvents = [];
+		target.addEventListener("keydown", (event) => {
+			keyEvents.push({
+				key: event.key,
+				code: event.code,
+			});
+		});
+		const keyboardResult = await api.page.call("event.dispatch", "#field", {
+			kind: "keyboard",
+			type: "keydown",
+			key: "A",
+			code: "KeyA",
+		});
+		assert.equal(keyboardResult, true);
+		assert.deepEqual(keyEvents, [{ key: "A", code: "KeyA" }]);
+	});
+});
+
+test("GM.page.call rejects unsupported operations and invalid specs", async () => {
+	await withApi(async ({ api }) => {
+		await assert.rejects(
+			api.page.call("dom.remove", "#target"),
+			/Unsupported page operation/,
+		);
+		await assert.rejects(
+			api.page.call("dom.queryText", ""),
+			/selector must be a non-empty string/,
+		);
+		await assert.rejects(
+			api.page.call("event.dispatch", "#target", {
+				kind: "mystery",
+				type: "open",
+			}),
+			/unsupported event kind/,
+		);
+		await assert.rejects(
+			api.page.call("event.dispatch", "#target", {
+				type: "open",
+				detail: "nope",
+			}),
+			/event spec key is not allowed/,
+		);
+	});
+});
+
+test("GM.page.call enforces a per-second rate limit", async () => {
+	await withApi(async ({ api, document }) => {
+		appendElement(document.body, "div", {
+			id: "rate-target",
+			textContent: "ready",
+		});
+		const realNow = Date.now;
+		Date.now = () => 5678;
+		try {
+			for (let i = 0; i < 20; i++) {
+				assert.equal(
+					await api.page.call("dom.queryText", "#rate-target"),
+					"ready",
+				);
+			}
+			await assert.rejects(
+				api.page.call("dom.queryText", "#rate-target"),
+				/rate limit exceeded/,
+			);
+		} finally {
+			Date.now = realNow;
+		}
+	});
+});
+
+test("rejects malformed browser-mediated page.call payloads", async () => {
+	await withApi(
+		async ({ api }) => {
+			await assert.rejects(
+				api.page.call("dom.queryText", "#target"),
+				/page\.call failed/,
+			);
+		},
+		{
+			globals: {
+				browser: {
+					runtime: {
+						async sendMessage() {
+							return {
+								status: "fulfilled",
+								result: {
+									ok: true,
+									value: "real",
+								},
+							};
+						},
+					},
+				},
+			},
+		},
+	);
 });

@@ -299,17 +299,6 @@ function deepFreeze(object) {
 	return Object.freeze(object);
 }
 
-/**
- * compatibility polyfill for Safari < 15.4
- * @see {@link https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Object/hasOwn#browser_compatibility}
- * @todo remove this polyfill when set safari strict_min_version 15.4
- * @see {@link https://developer.mozilla.org/en-US/docs/Mozilla/Add-ons/WebExtensions/manifest.json/browser_specific_settings#safari_properties}
- */
-if (Object.hasOwn === undefined) {
-	Object.hasOwn = (obj, prop) =>
-		Object.prototype.hasOwnProperty.call(obj, prop);
-}
-
 // export and define the operation method of settings storage
 // they are similar to browser.storage but slightly different
 

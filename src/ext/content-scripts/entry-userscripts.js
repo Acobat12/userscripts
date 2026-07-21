@@ -203,7 +203,11 @@ async function injection() {
 		// loop through each userscript @grant value, add methods as needed
 		for (let j = 0; j < grants.length; j++) {
 			const grant = grants[j];
-			const method = grant.startsWith("GM.") ? grant.slice(3) : grant;
+			const method = grant === "GM.page.call"
+				? "page"
+				: grant.startsWith("GM.")
+					? grant.slice(3)
+					: grant;
 			// ensure API method exists in USAPI object
 			if (!Object.keys(USAPI).includes(method)) continue;
 			// add granted methods
@@ -226,6 +230,11 @@ async function injection() {
 					} else {
 						userscript.apis[method] = USAPI[method].bind(xhrContext);
 					}
+					break;
+				case "page":
+					userscript.apis.GM.page = Object.freeze({
+						...USAPI.page,
+					});
 					break;
 				default:
 					userscript.apis.GM[method] = USAPI[method];

@@ -112,30 +112,37 @@ const PAGE_DATA_MAX_OBJECT_KEY_LENGTH = 512;
 const PAGE_DATA_MAX_CALLS_PER_WINDOW = 20;
 const PAGE_DATA_RATE_WINDOW_MS = 1000;
 const PAGE_DATA_MAX_ACTIVE_CALLS = 8;
+const PAGE_CALL_TIMEOUT_MS = 5000;
+const PAGE_CALL_MAX_ARGS_BYTES = 64 * 1024;
+const PAGE_CALL_MAX_RESULT_BYTES = 256 * 1024;
+const PAGE_CALL_MAX_OPERATION_LENGTH = 64;
+const PAGE_CALL_MAX_SELECTOR_LENGTH = 4096;
+const PAGE_CALL_MAX_EVENT_TYPE_LENGTH = 128;
+const PAGE_CALL_MAX_EVENT_STRING_LENGTH = 512;
+const PAGE_CALL_MAX_CALLS_PER_WINDOW = 20;
+const PAGE_CALL_RATE_WINDOW_MS = 1000;
+const PAGE_CALL_MAX_ACTIVE_CALLS = 8;
+const PAGE_CALL_ALLOWED_OPERATIONS = new Set([
+	"dom.queryText",
+	"dom.click",
+	"event.dispatch",
+]);
+const PAGE_CALL_ALLOWED_EVENT_KINDS = new Set([
+	"event",
+	"custom",
+	"mouse",
+	"keyboard",
+	"input",
+]);
 const pageDataTextEncoder =
 	typeof TextEncoder === "function" ? new TextEncoder() : null;
 const safeFunctionToString = Function.prototype.call.bind(
 	Function.prototype.toString,
 );
-const safePageAddEventListener = Function.prototype.call.bind(
-	EventTarget.prototype.addEventListener,
-);
-const safePageRemoveEventListener = Function.prototype.call.bind(
-	EventTarget.prototype.removeEventListener,
-);
-const safeCreateElement = Function.prototype.call.bind(
-	Document.prototype.createElement,
-);
-const safeAttachShadow = Function.prototype.call.bind(
-	Element.prototype.attachShadow,
-);
-const safeAppendChild = Function.prototype.call.bind(Node.prototype.appendChild);
-const safeRemoveChild = Function.prototype.call.bind(Node.prototype.removeChild);
-const safeRemoveNode = typeof Element.prototype.remove === "function"
-	? Function.prototype.call.bind(Element.prototype.remove)
-	: null;
 const pageDataCallTimes = [];
 let pageDataActiveCalls = 0;
+const pageCallTimes = [];
+let pageCallActiveCalls = 0;
 
 function randomRequestId() {
 	if (typeof globalThis.crypto?.randomUUID === "function") {
@@ -203,6 +210,117 @@ function reservePageDataCall() {
 	};
 }
 
+function reservePageCall() {
+	const now = Date.now();
+	while (
+		pageCallTimes.length &&
+		now - pageCallTimes[0] >= PAGE_CALL_RATE_WINDOW_MS
+	) {
+		pageCallTimes.shift();
+	}
+	if (pageCallTimes.length >= PAGE_CALL_MAX_CALLS_PER_WINDOW) {
+		throw new Error("page.call rate limit exceeded");
+	}
+	if (pageCallActiveCalls >= PAGE_CALL_MAX_ACTIVE_CALLS) {
+		throw new Error("page.call has too many active calls");
+	}
+	pageCallTimes.push(now);
+	pageCallActiveCalls += 1;
+	return () => {
+		if (pageCallActiveCalls > 0) {
+			pageCallActiveCalls -= 1;
+		}
+	};
+}
+
+function createSingleUseCallback(callback) {
+	let current =
+		typeof callback === "function"
+			? callback
+			: null;
+	return () => {
+		if (!current) return;
+		const callbackToRun = current;
+		current = null;
+		callbackToRun();
+	};
+}
+
+function awaitPageTaskResult(promise, timeoutMs, timeoutMessage) {
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		const timeoutId = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			reject(new Error(timeoutMessage));
+		}, timeoutMs);
+		Promise.resolve(promise).then(
+			(value) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timeoutId);
+				resolve(value);
+			},
+			(error) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timeoutId);
+				reject(error);
+			},
+		);
+	});
+}
+
+async function runPageTaskViaBackground({
+	backgroundTask,
+	defaultErrorMessage,
+	maxResultBytes,
+	oversizedResultMessage,
+	release,
+	timeoutMessage,
+	timeoutMs,
+}) {
+	const releaseOnce = createSingleUseCallback(release);
+	try {
+		const result = await awaitPageTaskResult(
+			sendMessageProxy({
+				name: "API_PAGE_EXECUTE",
+				task: backgroundTask,
+			}),
+			timeoutMs,
+			timeoutMessage,
+		);
+		if (
+			!result ||
+			typeof result !== "object" ||
+			Array.isArray(result) ||
+			result.transport !== "scripting.executeScript" ||
+			typeof result.ok !== "boolean"
+		) {
+			throw new Error(defaultErrorMessage);
+		}
+		if (result.ok !== true) {
+			throw new Error(
+				typeof result.error === "string" && result.error
+					? result.error
+					: defaultErrorMessage,
+			);
+		}
+		const normalizedValue = normalizePageDataSerializableValue(result.value);
+		const normalizedJson = JSON.stringify(normalizedValue);
+		if (pageDataByteLength(normalizedJson) > maxResultBytes) {
+			throw new Error(oversizedResultMessage);
+		}
+		return normalizedValue;
+	} catch (error) {
+		throw error instanceof Error
+			? error
+			: new Error(String(error?.message || error || defaultErrorMessage));
+	} finally {
+		releaseOnce();
+	}
+}
+
 function normalizePageDataSerializableValue(
 	value,
 	depth = 0,
@@ -266,139 +384,224 @@ function normalizePageDataSerializableValue(
 	}
 }
 
-function buildPageDataScript(responseEvent, extractorSource, argsJson) {
-	return `(() => {
-	const __US_RESPONSE_EVENT__ = ${JSON.stringify(responseEvent)};
-	const __US_ARGS__ = ${argsJson};
-	const __US_MAX_DEPTH__ = ${PAGE_DATA_MAX_DEPTH};
-	const __US_MAX_ARRAY_LENGTH__ = ${PAGE_DATA_MAX_ARRAY_LENGTH};
-	const __US_MAX_OBJECT_KEYS__ = ${PAGE_DATA_MAX_OBJECT_KEYS};
-	const __US_MAX_OBJECT_KEY_LENGTH__ = ${PAGE_DATA_MAX_OBJECT_KEY_LENGTH};
-	const __US_MAX_RESULT_BYTES__ = ${PAGE_DATA_MAX_RESULT_BYTES};
-	const __US_byteLength = (value) => {
-		const text = String(value ?? "");
-		if (typeof TextEncoder === "function") {
-			return new TextEncoder().encode(text).byteLength;
-		}
-		return text.length * 2;
-	};
-	const __US_isPlainObject = (value) => {
-		if (value == null || typeof value !== "object" || Array.isArray(value)) {
-			return false;
-		}
-		try {
-			const prototype = Object.getPrototypeOf(value);
-			return prototype === Object.prototype || prototype === null;
-		} catch {
-			return false;
-		}
-	};
-	const __US_isSafeKey = (key) =>
-		key !== "__proto__" &&
-		key !== "prototype" &&
-		key !== "constructor";
-	const __US_normalize = (value, depth = 0, seen = new WeakSet()) => {
-		if (depth > __US_MAX_DEPTH__) {
-			throw new Error("Page data result exceeds maximum depth");
-		}
-		if (value === null) return null;
-		switch (typeof value) {
-			case "string":
-			case "boolean":
-				return value;
-			case "number":
-				if (!Number.isFinite(value)) {
-					throw new Error("Page data result contains a non-finite number");
-				}
-				return value;
-			case "object":
-				break;
-			default:
-				throw new Error("Page data result contains an unsupported type");
-		}
-		if (seen.has(value)) {
-			throw new Error("Page data result contains a cycle");
-		}
-		seen.add(value);
-		try {
-			if (Array.isArray(value)) {
-				if (value.length > __US_MAX_ARRAY_LENGTH__) {
-					throw new Error("Page data result array is too large");
-				}
-				return value.map((item) => __US_normalize(item, depth + 1, seen));
-			}
-			if (!__US_isPlainObject(value)) {
-				throw new Error("Page data result object must be plain");
-			}
-			const entries = Object.entries(value);
-			if (entries.length > __US_MAX_OBJECT_KEYS__) {
-				throw new Error("Page data result object has too many keys");
-			}
-			const result = Object.create(null);
-			for (const [key, entryValue] of entries) {
-				if (key.length > __US_MAX_OBJECT_KEY_LENGTH__) {
-					throw new Error("Page data result object key is too long");
-				}
-				if (!__US_isSafeKey(key)) {
-					throw new Error("Page data result object key is not allowed");
-				}
-				result[key] = __US_normalize(entryValue, depth + 1, seen);
-			}
-			return result;
-		} finally {
-			seen.delete(value);
-		}
-	};
-	const __US_send = (payload) => {
-		let json;
-		try {
-			json = JSON.stringify(payload);
-		} catch (error) {
-			json = JSON.stringify({
-				ok: false,
-				error: String(error?.message || error),
-			});
-		}
-		if (__US_byteLength(json) > __US_MAX_RESULT_BYTES__) {
-			json = JSON.stringify({
-				ok: false,
-				error: "Page data result is too large",
-			});
-		}
-		document.dispatchEvent(new CustomEvent(__US_RESPONSE_EVENT__, {
-			detail: json,
-		}));
-	};
-	try {
-		const __US_extractor = (${extractorSource});
-		Promise.resolve(__US_extractor(...__US_ARGS__)).then(
-			(value) => {
-				try {
-					__US_send({
-						ok: true,
-						value: __US_normalize(value),
-					});
-				} catch (error) {
-					__US_send({
-						ok: false,
-						error: String(error?.message || error),
-					});
-				}
-			},
-			(error) => {
-				__US_send({
-					ok: false,
-					error: String(error?.message || error),
-				});
-			},
-		);
-	} catch (error) {
-		__US_send({
-			ok: false,
-			error: String(error?.message || error),
-		});
+function normalizePageCallOperation(operation) {
+	if (typeof operation !== "string" || !operation.length) {
+		throw new Error("page.call operation must be a non-empty string");
 	}
-})();`;
+	if (operation.length > PAGE_CALL_MAX_OPERATION_LENGTH) {
+		throw new Error("page.call operation is too long");
+	}
+	if (!PAGE_CALL_ALLOWED_OPERATIONS.has(operation)) {
+		throw new Error(`Unsupported page operation: ${operation}`);
+	}
+	return operation;
+}
+
+function normalizePageCallSelector(selector) {
+	if (typeof selector !== "string" || !selector.trim()) {
+		throw new Error("page.call selector must be a non-empty string");
+	}
+	if (selector.length > PAGE_CALL_MAX_SELECTOR_LENGTH) {
+		throw new Error("page.call selector is too long");
+	}
+	return selector;
+}
+
+function normalizePageCallBoolean(value, label) {
+	if (typeof value !== "boolean") {
+		throw new Error(`${label} must be a boolean`);
+	}
+	return value;
+}
+
+function normalizePageCallNumber(value, label) {
+	if (!Number.isFinite(value)) {
+		throw new Error(`${label} must be a finite number`);
+	}
+	return value;
+}
+
+function normalizePageCallString(value, label) {
+	if (typeof value !== "string") {
+		throw new Error(`${label} must be a string`);
+	}
+	if (value.length > PAGE_CALL_MAX_EVENT_STRING_LENGTH) {
+		throw new Error(`${label} is too long`);
+	}
+	return value;
+}
+
+function normalizePageCallEventSpec(spec) {
+	const normalizedSpec = normalizePageDataSerializableValue(spec);
+	if (!isPageDataPlainObject(normalizedSpec)) {
+		throw new Error("page.call event spec must be a plain object");
+	}
+	const hasOwn = (key) =>
+		Object.prototype.hasOwnProperty.call(normalizedSpec, key);
+	const kind = hasOwn("kind")
+		? normalizePageCallString(normalizedSpec.kind, "page.call event kind")
+		: "event";
+	if (!PAGE_CALL_ALLOWED_EVENT_KINDS.has(kind)) {
+		throw new Error(`page.call unsupported event kind: ${kind}`);
+	}
+	const type = normalizePageCallString(
+		normalizedSpec.type,
+		"page.call event type",
+	);
+	if (!type.length) {
+		throw new Error("page.call event type must not be empty");
+	}
+	if (type.length > PAGE_CALL_MAX_EVENT_TYPE_LENGTH) {
+		throw new Error("page.call event type is too long");
+	}
+	const allowedKeys = new Set(["kind", "type", "bubbles", "cancelable", "composed"]);
+	if (kind === "custom") {
+		allowedKeys.add("detail");
+	} else if (kind === "mouse") {
+		for (const key of [
+			"button",
+			"buttons",
+			"clientX",
+			"clientY",
+			"screenX",
+			"screenY",
+			"ctrlKey",
+			"shiftKey",
+			"altKey",
+			"metaKey",
+		]) {
+			allowedKeys.add(key);
+		}
+	} else if (kind === "keyboard") {
+		for (const key of [
+			"key",
+			"code",
+			"location",
+			"repeat",
+			"ctrlKey",
+			"shiftKey",
+			"altKey",
+			"metaKey",
+		]) {
+			allowedKeys.add(key);
+		}
+	} else if (kind === "input") {
+		for (const key of ["data", "inputType", "isComposing"]) {
+			allowedKeys.add(key);
+		}
+	}
+	for (const key of Object.keys(normalizedSpec)) {
+		if (!allowedKeys.has(key)) {
+			throw new Error(`page.call event spec key is not allowed: ${key}`);
+		}
+	}
+	const result = Object.create(null);
+	result.kind = kind;
+	result.type = type;
+	if (hasOwn("bubbles")) {
+		result.bubbles = normalizePageCallBoolean(
+			normalizedSpec.bubbles,
+			"page.call event bubbles",
+		);
+	}
+	if (hasOwn("cancelable")) {
+		result.cancelable = normalizePageCallBoolean(
+			normalizedSpec.cancelable,
+			"page.call event cancelable",
+		);
+	}
+	if (hasOwn("composed")) {
+		result.composed = normalizePageCallBoolean(
+			normalizedSpec.composed,
+			"page.call event composed",
+		);
+	}
+	if (kind === "custom" && hasOwn("detail")) {
+		result.detail = normalizedSpec.detail;
+	}
+	if (kind === "mouse") {
+		for (const key of ["button", "buttons", "clientX", "clientY", "screenX", "screenY"]) {
+			if (hasOwn(key)) {
+				result[key] = normalizePageCallNumber(
+					normalizedSpec[key],
+					`page.call event ${key}`,
+				);
+			}
+		}
+		for (const key of ["ctrlKey", "shiftKey", "altKey", "metaKey"]) {
+			if (hasOwn(key)) {
+				result[key] = normalizePageCallBoolean(
+					normalizedSpec[key],
+					`page.call event ${key}`,
+				);
+			}
+		}
+	}
+	if (kind === "keyboard") {
+		for (const key of ["key", "code"]) {
+			if (hasOwn(key)) {
+				result[key] = normalizePageCallString(
+					normalizedSpec[key],
+					`page.call event ${key}`,
+				);
+			}
+		}
+		if (hasOwn("location")) {
+			result.location = normalizePageCallNumber(
+				normalizedSpec.location,
+				"page.call event location",
+			);
+		}
+		for (const key of ["repeat", "ctrlKey", "shiftKey", "altKey", "metaKey"]) {
+			if (hasOwn(key)) {
+				result[key] = normalizePageCallBoolean(
+					normalizedSpec[key],
+					`page.call event ${key}`,
+				);
+			}
+		}
+	}
+	if (kind === "input") {
+		for (const key of ["data", "inputType"]) {
+			if (hasOwn(key)) {
+				result[key] = normalizePageCallString(
+					normalizedSpec[key],
+					`page.call event ${key}`,
+				);
+			}
+		}
+		if (hasOwn("isComposing")) {
+			result.isComposing = normalizePageCallBoolean(
+				normalizedSpec.isComposing,
+				"page.call event isComposing",
+			);
+		}
+	}
+	return result;
+}
+
+function normalizePageCallArgs(operation, args) {
+	if (!Array.isArray(args)) {
+		throw new Error("page.call arguments must be an array");
+	}
+	switch (operation) {
+		case "dom.queryText":
+		case "dom.click":
+			if (args.length !== 1) {
+				throw new Error(`page.call ${operation} expects exactly 1 argument`);
+			}
+			return [normalizePageCallSelector(args[0])];
+		case "event.dispatch":
+			if (args.length !== 2) {
+				throw new Error("page.call event.dispatch expects exactly 2 arguments");
+			}
+			return [
+				normalizePageCallSelector(args[0]),
+				normalizePageCallEventSpec(args[1]),
+			];
+		default:
+			throw new Error(`Unsupported page operation: ${operation}`);
+	}
 }
 
 async function getPageData(extractor, ...args) {
@@ -425,74 +628,56 @@ async function getPageData(extractor, ...args) {
 	} catch (error) {
 		return Promise.reject(error);
 	}
-	const responseEvent = `__userscripts_page_data_response_${randomRequestId()}__`;
-	return new Promise((resolve, reject) => {
-		let host = null;
-		let settled = false;
-		let timeoutId;
-		let releaseCall = releasePageDataCall;
-		const cleanup = () => {
-			safePageRemoveEventListener(document, responseEvent, onResponse);
-			clearTimeout(timeoutId);
-			if (releaseCall) {
-				releaseCall();
-				releaseCall = null;
-			}
-			try {
-				if (host && safeRemoveNode) {
-					safeRemoveNode(host);
-				} else if (host?.parentNode) {
-					safeRemoveChild(host.parentNode, host);
-				}
-			} catch {
-				// Ignore cleanup failures.
-			}
-		};
-		const onResponse = (event) => {
-			if (settled || typeof event.detail !== "string") return;
-			settled = true;
-			cleanup();
-			try {
-				if (pageDataByteLength(event.detail) > PAGE_DATA_MAX_RESULT_BYTES) {
-					throw new Error("getPageData result is too large");
-				}
-				const payload = JSON.parse(event.detail);
-				if (payload?.ok === true) {
-					resolve(normalizePageDataSerializableValue(payload.value));
-					return;
-				}
-				reject(new Error(payload?.error || "getPageData failed"));
-			} catch (error) {
-				reject(error);
-			}
-		};
-		try {
-			safePageAddEventListener(document, responseEvent, onResponse);
-			timeoutId = setTimeout(() => {
-				if (settled) return;
-				settled = true;
-				cleanup();
-				reject(new Error("getPageData timed out"));
-			}, PAGE_DATA_TIMEOUT_MS);
-			host = safeCreateElement(document, "div");
-			host.style.display = "none";
-			const shadowRoot = safeAttachShadow(host, { mode: "closed" });
-			const tag = safeCreateElement(document, "script");
-			tag.textContent = buildPageDataScript(
-				responseEvent,
-				extractorSource,
-				argsJson,
-			);
-			safeAppendChild(shadowRoot, tag);
-			safeAppendChild(
-				document.body ?? document.head ?? document.documentElement,
-				host,
-			);
-		} catch (error) {
-			settled = true;
-			cleanup();
-			reject(error);
-		}
+	return runPageTaskViaBackground({
+		backgroundTask: {
+			kind: "getPageData",
+			extractorSource,
+			argsJson,
+		},
+		defaultErrorMessage: "getPageData failed",
+		maxResultBytes: PAGE_DATA_MAX_RESULT_BYTES,
+		oversizedResultMessage: "Page data result is too large",
+		release: releasePageDataCall,
+		timeoutMessage: "getPageData timed out",
+		timeoutMs: PAGE_DATA_TIMEOUT_MS,
+	});
+}
+
+async function pageCall(operation, ...args) {
+	let normalizedOperation;
+	try {
+		normalizedOperation = normalizePageCallOperation(operation);
+	} catch (error) {
+		return Promise.reject(error);
+	}
+	let normalizedArgs;
+	try {
+		normalizedArgs = normalizePageCallArgs(normalizedOperation, args);
+	} catch (error) {
+		return Promise.reject(error);
+	}
+	const argsJson = JSON.stringify(normalizedArgs);
+	if (pageDataByteLength(argsJson) > PAGE_CALL_MAX_ARGS_BYTES) {
+		return Promise.reject(new Error("page.call arguments are too large"));
+	}
+	let releasePageCall;
+	try {
+		releasePageCall = reservePageCall();
+	} catch (error) {
+		return Promise.reject(error);
+	}
+	return runPageTaskViaBackground({
+		backgroundTask: {
+			kind: "pageCall",
+			operation: normalizedOperation,
+			argsJson,
+		},
+		defaultErrorMessage: "page.call failed",
+		maxResultBytes: PAGE_CALL_MAX_RESULT_BYTES,
+		oversizedResultMessage: "page.call result is too large",
+		release: releasePageCall,
+		timeoutMessage: "page.call timed out",
+		timeoutMs: PAGE_CALL_TIMEOUT_MS,
 	});
 }
 
@@ -1063,6 +1248,9 @@ export default {
 	listValues,
 	deleteValue,
 	getPageData,
+	page: Object.freeze({
+		call: pageCall,
+	}),
 	openInTab,
 	getTab,
 	saveTab,

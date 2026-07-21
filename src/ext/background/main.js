@@ -37,6 +37,21 @@ const BACKGROUND_XHR_MAX_TIMEOUT_MS = 120_000;
 const BACKGROUND_XHR_MAX_HEADER_COUNT = 64;
 const BACKGROUND_XHR_MAX_HEADER_VALUE_LENGTH = 8192;
 const BACKGROUND_XHR_MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
+const BACKGROUND_PAGE_DATA_MAX_EXTRACTOR_BYTES = 100_000;
+const BACKGROUND_PAGE_DATA_MAX_ARGS_BYTES = 256 * 1024;
+const BACKGROUND_PAGE_DATA_MAX_RESULT_BYTES = 2 * 1024 * 1024;
+const BACKGROUND_PAGE_DATA_MAX_DEPTH = 32;
+const BACKGROUND_PAGE_DATA_MAX_ARRAY_LENGTH = 4096;
+const BACKGROUND_PAGE_DATA_MAX_OBJECT_KEYS = 128;
+const BACKGROUND_PAGE_DATA_MAX_OBJECT_KEY_LENGTH = 512;
+const BACKGROUND_PAGE_CALL_MAX_ARGS_BYTES = 64 * 1024;
+const BACKGROUND_PAGE_CALL_MAX_RESULT_BYTES = 256 * 1024;
+const BACKGROUND_PAGE_CALL_MAX_OPERATION_LENGTH = 64;
+const BACKGROUND_PAGE_CALL_ALLOWED_OPERATIONS = new Set([
+	"dom.queryText",
+	"dom.click",
+	"event.dispatch",
+]);
 const BACKGROUND_XHR_HANDLER_NAMES = new Set([
 	"onreadystatechange",
 	"onloadstart",
@@ -65,6 +80,419 @@ function backgroundByteLength(value) {
 		return backgroundTextEncoder.encode(text).byteLength;
 	}
 	return text.length * 2;
+}
+
+function backgroundIsPlainObject(value) {
+	if (value == null || typeof value !== "object" || Array.isArray(value)) {
+		return false;
+	}
+	try {
+		const prototype = Object.getPrototypeOf(value);
+		return prototype === Object.prototype || prototype === null;
+	} catch {
+		return false;
+	}
+}
+
+function normalizeBackgroundPageTask(task) {
+	if (!backgroundIsPlainObject(task)) {
+		throw new Error("Invalid page task");
+	}
+	if (task.kind === "getPageData") {
+		if (typeof task.extractorSource !== "string" || !task.extractorSource.length) {
+			throw new Error("Invalid page data extractor");
+		}
+		if (
+			backgroundByteLength(task.extractorSource) >
+			BACKGROUND_PAGE_DATA_MAX_EXTRACTOR_BYTES
+		) {
+			throw new Error("Page data extractor is too large");
+		}
+		if (typeof task.argsJson !== "string") {
+			throw new Error("Invalid page data arguments");
+		}
+		if (backgroundByteLength(task.argsJson) > BACKGROUND_PAGE_DATA_MAX_ARGS_BYTES) {
+			throw new Error("Page data arguments are too large");
+		}
+		let parsedArgs;
+		try {
+			parsedArgs = JSON.parse(task.argsJson);
+		} catch {
+			throw new Error("Invalid page data arguments");
+		}
+		if (!Array.isArray(parsedArgs)) {
+			throw new Error("Page data arguments must be an array");
+		}
+		return {
+			kind: task.kind,
+			argsJson: JSON.stringify(parsedArgs),
+			extractorSource: task.extractorSource,
+			maxResultBytes: BACKGROUND_PAGE_DATA_MAX_RESULT_BYTES,
+			oversizedResultMessage: "Page data result is too large",
+		};
+	}
+	if (task.kind === "pageCall") {
+		if (
+			typeof task.operation !== "string" ||
+			!task.operation.length ||
+			task.operation.length > BACKGROUND_PAGE_CALL_MAX_OPERATION_LENGTH
+		) {
+			throw new Error("Invalid page operation");
+		}
+		if (!BACKGROUND_PAGE_CALL_ALLOWED_OPERATIONS.has(task.operation)) {
+			throw new Error("Unsupported page operation");
+		}
+		if (typeof task.argsJson !== "string") {
+			throw new Error("Invalid page.call arguments");
+		}
+		if (backgroundByteLength(task.argsJson) > BACKGROUND_PAGE_CALL_MAX_ARGS_BYTES) {
+			throw new Error("page.call arguments are too large");
+		}
+		let parsedArgs;
+		try {
+			parsedArgs = JSON.parse(task.argsJson);
+		} catch {
+			throw new Error("Invalid page.call arguments");
+		}
+		if (!Array.isArray(parsedArgs)) {
+			throw new Error("page.call arguments must be an array");
+		}
+		return {
+			kind: task.kind,
+			argsJson: JSON.stringify(parsedArgs),
+			maxResultBytes: BACKGROUND_PAGE_CALL_MAX_RESULT_BYTES,
+			operation: task.operation,
+			oversizedResultMessage: "page.call result is too large",
+		};
+	}
+	throw new Error("Unsupported page task");
+}
+
+function buildBackgroundPageExecutorPrelude(
+	maxResultBytes,
+	oversizedResultMessage,
+) {
+	return `
+	const __US_MAX_DEPTH__ = ${BACKGROUND_PAGE_DATA_MAX_DEPTH};
+	const __US_MAX_ARRAY_LENGTH__ = ${BACKGROUND_PAGE_DATA_MAX_ARRAY_LENGTH};
+	const __US_MAX_OBJECT_KEYS__ = ${BACKGROUND_PAGE_DATA_MAX_OBJECT_KEYS};
+	const __US_MAX_OBJECT_KEY_LENGTH__ = ${BACKGROUND_PAGE_DATA_MAX_OBJECT_KEY_LENGTH};
+	const __US_MAX_RESULT_BYTES__ = ${maxResultBytes};
+	const __US_OVERSIZED_RESULT_MESSAGE__ = ${JSON.stringify(oversizedResultMessage)};
+	const __US_byteLength = (value) => {
+		const text = String(value ?? "");
+		if (typeof TextEncoder === "function") {
+			return new TextEncoder().encode(text).byteLength;
+		}
+		return text.length * 2;
+	};
+	const __US_isPlainObject = (value) => {
+		if (value == null || typeof value !== "object" || Array.isArray(value)) {
+			return false;
+		}
+		try {
+			const prototype = Object.getPrototypeOf(value);
+			return prototype === Object.prototype || prototype === null;
+		} catch {
+			return false;
+		}
+	};
+	const __US_isSafeKey = (key) =>
+		key !== "__proto__" &&
+		key !== "prototype" &&
+		key !== "constructor";
+	const __US_normalize = (value, depth = 0, seen = new WeakSet()) => {
+		if (depth > __US_MAX_DEPTH__) {
+			throw new Error("Page data result exceeds maximum depth");
+		}
+		if (value === null) return null;
+		switch (typeof value) {
+			case "string":
+			case "boolean":
+				return value;
+			case "number":
+				if (!Number.isFinite(value)) {
+					throw new Error("Page data result contains a non-finite number");
+				}
+				return value;
+			case "object":
+				break;
+			default:
+				throw new Error("Page data result contains an unsupported type");
+		}
+		if (seen.has(value)) {
+			throw new Error("Page data result contains a cycle");
+		}
+		seen.add(value);
+		try {
+			if (Array.isArray(value)) {
+				if (value.length > __US_MAX_ARRAY_LENGTH__) {
+					throw new Error("Page data result array is too large");
+				}
+				return value.map((item) => __US_normalize(item, depth + 1, seen));
+			}
+			if (!__US_isPlainObject(value)) {
+				throw new Error("Page data result object must be plain");
+			}
+			const entries = Object.entries(value);
+			if (entries.length > __US_MAX_OBJECT_KEYS__) {
+				throw new Error("Page data result object has too many keys");
+			}
+			const result = Object.create(null);
+			for (const [key, entryValue] of entries) {
+				if (key.length > __US_MAX_OBJECT_KEY_LENGTH__) {
+					throw new Error("Page data result object key is too long");
+				}
+				if (!__US_isSafeKey(key)) {
+					throw new Error("Page data result object key is not allowed");
+				}
+				result[key] = __US_normalize(entryValue, depth + 1, seen);
+			}
+			return result;
+		} finally {
+			seen.delete(value);
+		}
+	};
+	const __US_fail = (error) => ({
+		ok: false,
+		error: String(error?.message || error),
+	});
+	const __US_success = (value) => {
+		const normalized = __US_normalize(value);
+		const json = JSON.stringify(normalized);
+		if (__US_byteLength(json) > __US_MAX_RESULT_BYTES__) {
+			throw new Error(__US_OVERSIZED_RESULT_MESSAGE__);
+		}
+		return {
+			ok: true,
+			value: normalized,
+		};
+	};
+`;
+}
+
+function buildBackgroundPageDataExecutor(extractorSource, argsJson) {
+	return new Function(`
+${buildBackgroundPageExecutorPrelude(
+	BACKGROUND_PAGE_DATA_MAX_RESULT_BYTES,
+	"Page data result is too large",
+)}
+	const __US_ARGS__ = ${argsJson};
+	try {
+		const __US_extractor = (${extractorSource});
+		return Promise.resolve(__US_extractor(...__US_ARGS__)).then(
+			(value) => {
+				try {
+					return __US_success(value);
+				} catch (error) {
+					return __US_fail(error);
+				}
+			},
+			(error) => __US_fail(error),
+		);
+	} catch (error) {
+		return __US_fail(error);
+	}
+`);
+}
+
+function buildBackgroundPageCallExecutor(operation, argsJson) {
+	return new Function(`
+${buildBackgroundPageExecutorPrelude(
+	BACKGROUND_PAGE_CALL_MAX_RESULT_BYTES,
+	"page.call result is too large",
+)}
+	const __US_OPERATION__ = ${JSON.stringify(operation)};
+	const __US_ARGS__ = ${argsJson};
+	const __US_selectTarget = (selector) => {
+		if (typeof selector !== "string" || !selector) {
+			throw new Error("Invalid page selector");
+		}
+		return document.querySelector(selector);
+	};
+	const __US_buildEvent = (spec) => {
+		if (!spec || typeof spec !== "object" || Array.isArray(spec)) {
+			throw new Error("Invalid event spec");
+		}
+		const init = {
+			bubbles: Boolean(spec.bubbles),
+			cancelable: Boolean(spec.cancelable),
+			composed: Boolean(spec.composed),
+		};
+		switch (spec.kind) {
+			case "custom":
+				if (Object.prototype.hasOwnProperty.call(spec, "detail")) {
+					init.detail = spec.detail;
+				}
+				return new CustomEvent(spec.type, init);
+			case "mouse":
+				for (const key of [
+					"button",
+					"buttons",
+					"clientX",
+					"clientY",
+					"screenX",
+					"screenY",
+					"ctrlKey",
+					"shiftKey",
+					"altKey",
+					"metaKey",
+				]) {
+					if (Object.prototype.hasOwnProperty.call(spec, key)) {
+						init[key] = spec[key];
+					}
+				}
+				return new MouseEvent(spec.type, init);
+			case "keyboard":
+				for (const key of [
+					"key",
+					"code",
+					"location",
+					"repeat",
+					"ctrlKey",
+					"shiftKey",
+					"altKey",
+					"metaKey",
+				]) {
+					if (Object.prototype.hasOwnProperty.call(spec, key)) {
+						init[key] = spec[key];
+					}
+				}
+				return new KeyboardEvent(spec.type, init);
+			case "input":
+				for (const key of ["data", "inputType", "isComposing"]) {
+					if (Object.prototype.hasOwnProperty.call(spec, key)) {
+						init[key] = spec[key];
+					}
+				}
+				return typeof InputEvent === "function"
+					? new InputEvent(spec.type, init)
+					: new Event(spec.type, init);
+			default:
+				return new Event(spec.type, init);
+		}
+	};
+	const __US_OPERATIONS__ = {
+		"dom.queryText": (selector) => {
+			const target = __US_selectTarget(selector);
+			return target ? String(target.textContent ?? "") : null;
+		},
+		"dom.click": (selector) => {
+			const target = __US_selectTarget(selector);
+			if (!target) return false;
+			if (typeof target.click === "function") {
+				target.click();
+			} else {
+				target.dispatchEvent(new MouseEvent("click", {
+					bubbles: true,
+					cancelable: true,
+					composed: true,
+				}));
+			}
+			return true;
+		},
+		"event.dispatch": (selector, spec) => {
+			const target = __US_selectTarget(selector);
+			if (!target) return false;
+			return target.dispatchEvent(__US_buildEvent(spec));
+		},
+	};
+	try {
+		const __US_operation = __US_OPERATIONS__[__US_OPERATION__];
+		if (typeof __US_operation !== "function") {
+			throw new Error("Unsupported page operation");
+		}
+		return Promise.resolve(__US_operation(...__US_ARGS__)).then(
+			(value) => {
+				try {
+					return __US_success(value);
+				} catch (error) {
+					return __US_fail(error);
+				}
+			},
+			(error) => __US_fail(error),
+		);
+	} catch (error) {
+		return __US_fail(error);
+	}
+`);
+}
+
+async function executePageTaskInMainWorld(task, sender) {
+	const normalizedTask = normalizeBackgroundPageTask(task);
+	const tabId = sender?.tab?.id;
+	const frameId = Number.isInteger(sender?.frameId) ? sender.frameId : 0;
+	if (!Number.isInteger(tabId)) {
+		throw new Error("Missing tab id for page task");
+	}
+	if (typeof browser?.scripting?.executeScript !== "function") {
+		throw new Error("Page task transport is not available");
+	}
+	const func =
+		normalizedTask.kind === "getPageData"
+			? buildBackgroundPageDataExecutor(
+					normalizedTask.extractorSource,
+					normalizedTask.argsJson,
+				)
+			: buildBackgroundPageCallExecutor(
+					normalizedTask.operation,
+					normalizedTask.argsJson,
+				);
+	let injectionResults;
+	try {
+		injectionResults = await browser.scripting.executeScript({
+			target: {
+				tabId,
+				frameIds: [frameId],
+			},
+			world: "MAIN",
+			func,
+		});
+	} catch (error) {
+		throw new Error(
+			String(error?.message || error || "Page task transport failed"),
+		);
+	}
+	const [injectionResult] = Array.isArray(injectionResults) ? injectionResults : [];
+	if (!backgroundIsPlainObject(injectionResult)) {
+		throw new Error("Page task transport returned an invalid result");
+	}
+	if (Object.prototype.hasOwnProperty.call(injectionResult, "error")) {
+		return {
+			transport: "scripting.executeScript",
+			ok: false,
+			error: String(
+				injectionResult.error?.message || injectionResult.error || "Page task failed",
+			),
+		};
+	}
+	const result = injectionResult.result;
+	if (!backgroundIsPlainObject(result) || typeof result.ok !== "boolean") {
+		throw new Error("Page task transport returned an invalid payload");
+	}
+	if (result.ok !== true) {
+		return {
+			transport: "scripting.executeScript",
+			ok: false,
+			error:
+				typeof result.error === "string" && result.error
+					? result.error
+					: "Page task failed",
+		};
+	}
+	const resultJson = JSON.stringify(result.value);
+	if (backgroundByteLength(resultJson) > normalizedTask.maxResultBytes) {
+		return {
+			transport: "scripting.executeScript",
+			ok: false,
+			error: normalizedTask.oversizedResultMessage,
+		};
+	}
+	return {
+		transport: "scripting.executeScript",
+		ok: true,
+		value: result.value,
+	};
 }
 
 function sanitizeBackgroundXhrHeaders(input) {
@@ -307,7 +735,6 @@ async function setBadgeCount() {
 // 2. dnr item toggle event in the page occurs
 // 3. external editor changes script file content
 async function setDNRRulesets() {
-	// not supported below safari 15.4
 	if (!browser.declarativeNetRequest.updateDynamicRules) return;
 	const message = { name: "REQ_REQUESTS" };
 	const response = await sendNativeMessage(message);
@@ -546,6 +973,20 @@ async function handleMessage(message, sender) {
 		case "API_SET_CLIPBOARD": {
 			const result = setClipboard(message.clipboardData, message.type);
 			return { status: "fulfilled", result };
+		}
+		case "API_PAGE_EXECUTE": {
+			try {
+				const result = await executePageTaskInMainWorld(message.task, sender);
+				return { status: "fulfilled", result };
+			} catch (error) {
+				console.error(error);
+				return {
+					status: "rejected",
+					result: {
+						message: String(error?.message || error),
+					},
+				};
+			}
 		}
 		case "API_XHR": {
 			try {
