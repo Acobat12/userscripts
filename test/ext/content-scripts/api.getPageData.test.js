@@ -261,7 +261,7 @@ class FakeWindow {
 	}
 }
 
-function installFakeDom() {
+function installFakeDom(extraGlobals = {}) {
 	const previousGlobals = new Map();
 	const document = new FakeDocument();
 	const window = new FakeWindow(document);
@@ -281,6 +281,7 @@ function installFakeDom() {
 		window,
 		location,
 		app: undefined,
+		...extraGlobals,
 	};
 	for (const [key, value] of Object.entries(globalAssignments)) {
 		previousGlobals.set(
@@ -352,8 +353,14 @@ async function loadApi() {
 	return module.default;
 }
 
-async function withApi(run) {
-	const dom = installFakeDom();
+async function flushMicrotasks(count = 1) {
+	for (let i = 0; i < count; i++) {
+		await Promise.resolve();
+	}
+}
+
+async function withApi(run, options = {}) {
+	const dom = installFakeDom(options.globals);
 	try {
 		const api = await loadApi();
 		await run({ api, document: dom.document, window: dom.window });
@@ -432,6 +439,7 @@ test("supports async extractors and removes injected DOM after completion", asyn
 					}, 0);
 				}),
 		);
+		await flushMicrotasks();
 		assert.equal(document.body.childNodes.length, 1);
 		const result = await pending;
 		assert.equal(document.body.childNodes.length, 0);
@@ -495,6 +503,115 @@ test("enforces a per-second rate limit", async () => {
 	});
 });
 
+test("uses browser-mediated transport for getPageData when available", async () => {
+	const messages = [];
+	await withApi(
+		async ({ api, document }) => {
+			const result = await api.getPageData(() => ({
+				userId: "page-value",
+			}));
+			assert.equal(messages.length, 1);
+			assert.equal(messages[0].name, "API_PAGE_EXECUTE");
+			assert.equal(messages[0].task.kind, "getPageData");
+			assert.equal(messages[0].task.argsJson, "[]");
+			assert.equal(document.body.childNodes.length, 0);
+			assert.equal(Object.getPrototypeOf(result), null);
+			assert.equal(result.userId, "from-background");
+		},
+		{
+			globals: {
+				browser: {
+					runtime: {
+						async sendMessage(message) {
+							messages.push(message);
+							return {
+								status: "fulfilled",
+								result: {
+									transport: "scripting.executeScript",
+									ok: true,
+									value: {
+										userId: "from-background",
+									},
+								},
+							};
+						},
+					},
+				},
+			},
+		},
+	);
+});
+
+test("falls back to the DOM bridge when browser-mediated transport is unavailable", async () => {
+	const messages = [];
+	await withApi(
+		async ({ api, document }) => {
+			const pending = api.getPageData(
+				() =>
+					new Promise((resolve) => {
+						setTimeout(() => resolve("fallback"), 0);
+					}),
+			);
+			assert.equal(messages.length, 1);
+			await flushMicrotasks();
+			assert.equal(document.body.childNodes.length, 1);
+			assert.equal(await pending, "fallback");
+			assert.equal(document.body.childNodes.length, 0);
+		},
+		{
+			globals: {
+				browser: {
+					runtime: {
+						async sendMessage(message) {
+							messages.push(message);
+							return {
+								status: "fulfilled",
+								result: {
+									transportUnavailable: true,
+								},
+							};
+						},
+					},
+				},
+			},
+		},
+	);
+});
+
+test("uses browser-mediated transport for GM.page.call when available", async () => {
+	const messages = [];
+	await withApi(
+		async ({ api, document }) => {
+			assert.equal(await api.page.call("dom.queryText", "#target"), "from-background");
+			assert.equal(messages.length, 1);
+			assert.equal(messages[0].name, "API_PAGE_EXECUTE");
+			assert.equal(messages[0].task.kind, "pageCall");
+			assert.equal(messages[0].task.operation, "dom.queryText");
+			assert.equal(messages[0].task.argsJson, '["#target"]');
+			assert.equal(document.body.childNodes.length, 0);
+		},
+		{
+			globals: {
+				browser: {
+					runtime: {
+						async sendMessage(message) {
+							messages.push(message);
+							return {
+								status: "fulfilled",
+								result: {
+									transport: "scripting.executeScript",
+									ok: true,
+									value: "from-background",
+								},
+							};
+						},
+					},
+				},
+			},
+		},
+	);
+});
+
 test("treats spoofed response events as untrusted page data", async () => {
 	await withApi(async ({ api, document }) => {
 		const realDispatch = document.dispatchEvent.bind(document);
@@ -511,7 +628,7 @@ test("treats spoofed response events as untrusted page data", async () => {
 		const pending = api.getPageData(() => ({
 			userId: "real",
 		}));
-		await Promise.resolve();
+		await flushMicrotasks(2);
 		assert.ok(swallowedResponseEvent);
 		assert.equal(typeof swallowedResponseDetail, "string");
 		const capturedPayload = JSON.parse(swallowedResponseDetail);
@@ -713,7 +830,7 @@ test("GM.page.call treats spoofed response events as untrusted page data", async
 			return realDispatch(event);
 		};
 		const pending = api.page.call("dom.queryText", "#spoof-target");
-		await Promise.resolve();
+		await flushMicrotasks(2);
 		assert.ok(swallowedResponseEvent);
 		assert.equal(typeof swallowedResponseDetail, "string");
 		const capturedPayload = JSON.parse(swallowedResponseDetail);
