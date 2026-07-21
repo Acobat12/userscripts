@@ -9,7 +9,7 @@
 		"dev:ios-safari": "SAFARI_PLATFORM=ios node scripts/dev-safari.js",
 		"build:mac-safari-16.4": "SAFARI_PLATFORM=mac node scripts/build-safari-16.4.js",
 		"build:ios-safari-16.4": "SAFARI_PLATFORM=ios node scripts/build-safari-16.4.js",
-		"test:js": "node --test test/ext/content-scripts/api.getPageData.test.js test/ext/content-scripts/entry-userscripts.test.js",
+		"test:js": "node --test test/ext/content-scripts/api.getPageData.test.js test/ext/content-scripts/entry-userscripts.test.js test/ext/native/swift-valid-grants.test.js",
 		"lint:js": "eslint . && prettier --check . --plugin prettier-plugin-svelte",
 		"lint:css": "stylelint '**/*.{css,html,svelte}'",
 		"prettier": "prettier --write . --plugin prettier-plugin-svelte"
