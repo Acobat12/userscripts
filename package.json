@@ -7,8 +7,6 @@
 		"dev": "vite",
 		"dev:mac-safari": "SAFARI_PLATFORM=mac node scripts/dev-safari.js",
 		"dev:ios-safari": "SAFARI_PLATFORM=ios node scripts/dev-safari.js",
-		"build:mac-safari-15": "SAFARI_PLATFORM=mac node scripts/build-safari-15.js",
-		"build:ios-safari-15": "SAFARI_PLATFORM=ios node scripts/build-safari-15.js",
 		"build:mac-safari-16.4": "SAFARI_PLATFORM=mac node scripts/build-safari-16.4.js",
 		"build:ios-safari-16.4": "SAFARI_PLATFORM=ios node scripts/build-safari-16.4.js",
 		"test:js": "node --test test/ext/content-scripts/api.getPageData.test.js",
@@ -36,4 +34,3 @@
 		"vite": "^6.3.5"
 	}
 }
-
