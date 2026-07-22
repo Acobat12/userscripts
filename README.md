@@ -154,7 +154,7 @@ Userscripts Safari currently supports the following userscript metadata:
   - allows the user to choose which context to inject the script into
   - values: `auto` (default), `content`, `page`
     - `GM` apis are only available when using `content`
-    - when a script uses `@grant`, page/auto injection is forced to `content`; use `GM.getPageData(...)` if the script still needs page-context globals
+    - when a script uses `@grant`, page/auto injection is forced to `content`; use secure page APIs where supported, and prefer `GM.page.call(...)` for explicit page-context interactions
   - works like [violentmonkey](https://violentmonkey.github.io/api/metadata-block/#inject-into)
 - `@run-at`
   - allows the user to choose the injection timing
@@ -222,13 +222,14 @@ For API type definitions, please refer to: [`types.d.ts`](https://github.com/use
   - `extractor: Function`
   - `args: Any[]` - optional, must be JSON-serializable
   - runs the provided extractor function in the page context and returns only plain JSON-serializable data
-  - requires browser-mediated execution through `browser.scripting.executeScript({ world: "MAIN" })`
+  - requires a secure browser-mediated transport that can execute the extractor in `MAIN` world **without** relying on page-controlled bridges or dynamic `unsafe-eval`
   - functions, DOM nodes, class instances, blobs, streams, and other active objects are rejected
   - reserved object keys such as `__proto__`, `constructor`, and `prototype` are rejected
   - returned values are untrusted page data, not privileged handles
   - browser-mediated transport hardens the return path, but the result is still page-controlled because `MAIN` world code shares the page environment
   - timeout only rejects the waiting Promise; it cannot interrupt already-running page JavaScript such as an infinite loop
-  - use this when a script needs page globals while still keeping `GM_*` APIs in the content-script context
+  - this API may be unavailable on platforms where a secure transport for arbitrary extractor execution is not supported
+  - use this when a script needs page globals while still keeping `GM_*` APIs in the content-script context, and only when the current platform supports it securely
   - preferred for **reading** page state
   - typical grants:
 
@@ -263,6 +264,7 @@ const text = await GM.getPageData(
     - keep the extractor small and self-contained
     - return only the fields you actually need
     - validate the returned shape before using it
+    - handle explicit runtime rejection on platforms that do not support secure extractor execution
   - do not:
     - return DOM nodes, functions, promises that never settle, or large object graphs
     - assume the returned data is trustworthy just because it came from your own extractor
@@ -334,8 +336,8 @@ await GM.page.call("event.dispatch", "#app", {
 
 #### Safe Page Access Guidance
 
-- Prefer `GM.getPageData()` when you only need to **read** page state.
-- Prefer `GM.page.call(...)` when you need one small DOM interaction such as reading text, clicking, or dispatching a simple event.
+- Prefer `GM.getPageData()` only when the current platform explicitly supports a secure extractor transport.
+- Prefer `GM.page.call(...)` as the default safe page API when you need one small DOM interaction such as reading text, clicking, or dispatching a simple event.
 - Do **not** use either API as a substitute for `unsafeWindow`.
 - Treat all returned values as **page-controlled input**. Validate them before using them in privileged logic.
 - Keep selectors narrow and predictable. Broad selectors such as `"div"` or `"*"` are brittle and easy to misuse.

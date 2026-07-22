@@ -717,6 +717,34 @@ test("rejects when browser-mediated transport is unavailable", async () => {
 	);
 });
 
+test("surfaces explicit secure getPageData transport rejection", async () => {
+	await withApi(
+		async ({ api }) => {
+			await assert.rejects(
+				api.getPageData(() => "value"),
+				/secure GM\.getPageData transport is not available/i,
+			);
+		},
+		{
+			globals: {
+				browser: {
+					runtime: {
+						async sendMessage() {
+							return {
+								status: "rejected",
+								result: {
+									message:
+										"Secure GM.getPageData transport is not available on this platform; use GM.page.call instead",
+								},
+							};
+						},
+					},
+				},
+			},
+		},
+	);
+});
+
 test("uses browser-mediated transport for GM.page.call when available", async () => {
 	const messages = [];
 	await withApi(
