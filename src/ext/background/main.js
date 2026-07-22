@@ -159,7 +159,7 @@ function normalizeBackgroundPageTask(task) {
 		}
 		return {
 			kind: task.kind,
-			argsJson: JSON.stringify(parsedArgs),
+			args: parsedArgs,
 			maxResultBytes: BACKGROUND_PAGE_CALL_MAX_RESULT_BYTES,
 			operation: task.operation,
 			oversizedResultMessage: "page.call result is too large",
@@ -168,25 +168,27 @@ function normalizeBackgroundPageTask(task) {
 	throw new Error("Unsupported page task");
 }
 
-function buildBackgroundPageExecutorPrelude(
-	maxResultBytes,
-	oversizedResultMessage,
+function executeMainWorldPageCallTask(
+	operation,
+	args,
+	config,
 ) {
-	return `
-	const __US_MAX_DEPTH__ = ${BACKGROUND_PAGE_DATA_MAX_DEPTH};
-	const __US_MAX_ARRAY_LENGTH__ = ${BACKGROUND_PAGE_DATA_MAX_ARRAY_LENGTH};
-	const __US_MAX_OBJECT_KEYS__ = ${BACKGROUND_PAGE_DATA_MAX_OBJECT_KEYS};
-	const __US_MAX_OBJECT_KEY_LENGTH__ = ${BACKGROUND_PAGE_DATA_MAX_OBJECT_KEY_LENGTH};
-	const __US_MAX_RESULT_BYTES__ = ${maxResultBytes};
-	const __US_OVERSIZED_RESULT_MESSAGE__ = ${JSON.stringify(oversizedResultMessage)};
-	const __US_byteLength = (value) => {
+	const {
+		maxDepth,
+		maxArrayLength,
+		maxObjectKeys,
+		maxObjectKeyLength,
+		maxResultBytes,
+		oversizedResultMessage,
+	} = config;
+	const byteLength = (value) => {
 		const text = String(value ?? "");
 		if (typeof TextEncoder === "function") {
 			return new TextEncoder().encode(text).byteLength;
 		}
 		return text.length * 2;
 	};
-	const __US_isPlainObject = (value) => {
+	const isPlainObject = (value) => {
 		if (value == null || typeof value !== "object" || Array.isArray(value)) {
 			return false;
 		}
@@ -197,12 +199,12 @@ function buildBackgroundPageExecutorPrelude(
 			return false;
 		}
 	};
-	const __US_isSafeKey = (key) =>
+	const isSafeKey = (key) =>
 		key !== "__proto__" &&
 		key !== "prototype" &&
 		key !== "constructor";
-	const __US_normalize = (value, depth = 0, seen = new WeakSet()) => {
-		if (depth > __US_MAX_DEPTH__) {
+	const normalize = (value, depth = 0, seen = new WeakSet()) => {
+		if (depth > maxDepth) {
 			throw new Error("Page data result exceeds maximum depth");
 		}
 		if (value === null) return null;
@@ -226,91 +228,55 @@ function buildBackgroundPageExecutorPrelude(
 		seen.add(value);
 		try {
 			if (Array.isArray(value)) {
-				if (value.length > __US_MAX_ARRAY_LENGTH__) {
+				if (value.length > maxArrayLength) {
 					throw new Error("Page data result array is too large");
 				}
-				return value.map((item) => __US_normalize(item, depth + 1, seen));
+				return value.map((item) => normalize(item, depth + 1, seen));
 			}
-			if (!__US_isPlainObject(value)) {
+			if (!isPlainObject(value)) {
 				throw new Error("Page data result object must be plain");
 			}
 			const entries = Object.entries(value);
-			if (entries.length > __US_MAX_OBJECT_KEYS__) {
+			if (entries.length > maxObjectKeys) {
 				throw new Error("Page data result object has too many keys");
 			}
 			const result = Object.create(null);
 			for (const [key, entryValue] of entries) {
-				if (key.length > __US_MAX_OBJECT_KEY_LENGTH__) {
+				if (key.length > maxObjectKeyLength) {
 					throw new Error("Page data result object key is too long");
 				}
-				if (!__US_isSafeKey(key)) {
+				if (!isSafeKey(key)) {
 					throw new Error("Page data result object key is not allowed");
 				}
-				result[key] = __US_normalize(entryValue, depth + 1, seen);
+				result[key] = normalize(entryValue, depth + 1, seen);
 			}
 			return result;
 		} finally {
 			seen.delete(value);
 		}
 	};
-	const __US_fail = (error) => ({
+	const fail = (error) => ({
 		ok: false,
 		error: String(error?.message || error),
 	});
-	const __US_success = (value) => {
-		const normalized = __US_normalize(value);
+	const success = (value) => {
+		const normalized = normalize(value);
 		const json = JSON.stringify(normalized);
-		if (__US_byteLength(json) > __US_MAX_RESULT_BYTES__) {
-			throw new Error(__US_OVERSIZED_RESULT_MESSAGE__);
+		if (byteLength(json) > maxResultBytes) {
+			throw new Error(oversizedResultMessage);
 		}
 		return {
 			ok: true,
 			value: normalized,
 		};
 	};
-`;
-}
-
-function buildBackgroundPageDataExecutor(extractorSource, argsJson) {
-	return new Function(`
-${buildBackgroundPageExecutorPrelude(
-	BACKGROUND_PAGE_DATA_MAX_RESULT_BYTES,
-	"Page data result is too large",
-)}
-	const __US_ARGS__ = ${argsJson};
-	try {
-		const __US_extractor = (${extractorSource});
-		return Promise.resolve(__US_extractor(...__US_ARGS__)).then(
-			(value) => {
-				try {
-					return __US_success(value);
-				} catch (error) {
-					return __US_fail(error);
-				}
-			},
-			(error) => __US_fail(error),
-		);
-	} catch (error) {
-		return __US_fail(error);
-	}
-`);
-}
-
-function buildBackgroundPageCallExecutor(operation, argsJson) {
-	return new Function(`
-${buildBackgroundPageExecutorPrelude(
-	BACKGROUND_PAGE_CALL_MAX_RESULT_BYTES,
-	"page.call result is too large",
-)}
-	const __US_OPERATION__ = ${JSON.stringify(operation)};
-	const __US_ARGS__ = ${argsJson};
-	const __US_selectTarget = (selector) => {
+	const selectTarget = (selector) => {
 		if (typeof selector !== "string" || !selector) {
 			throw new Error("Invalid page selector");
 		}
 		return document.querySelector(selector);
 	};
-	const __US_buildEvent = (spec) => {
+	const buildEvent = (spec) => {
 		if (!spec || typeof spec !== "object" || Array.isArray(spec)) {
 			throw new Error("Invalid event spec");
 		}
@@ -372,13 +338,13 @@ ${buildBackgroundPageExecutorPrelude(
 				return new Event(spec.type, init);
 		}
 	};
-	const __US_OPERATIONS__ = {
+	const operations = {
 		"dom.queryText": (selector) => {
-			const target = __US_selectTarget(selector);
+			const target = selectTarget(selector);
 			return target ? String(target.textContent ?? "") : null;
 		},
 		"dom.click": (selector) => {
-			const target = __US_selectTarget(selector);
+			const target = selectTarget(selector);
 			if (!target) return false;
 			if (typeof target.click === "function") {
 				target.click();
@@ -392,30 +358,20 @@ ${buildBackgroundPageExecutorPrelude(
 			return true;
 		},
 		"event.dispatch": (selector, spec) => {
-			const target = __US_selectTarget(selector);
+			const target = selectTarget(selector);
 			if (!target) return false;
-			return target.dispatchEvent(__US_buildEvent(spec));
+			return target.dispatchEvent(buildEvent(spec));
 		},
 	};
 	try {
-		const __US_operation = __US_OPERATIONS__[__US_OPERATION__];
-		if (typeof __US_operation !== "function") {
+		const action = operations[operation];
+		if (typeof action !== "function") {
 			throw new Error("Unsupported page operation");
 		}
-		return Promise.resolve(__US_operation(...__US_ARGS__)).then(
-			(value) => {
-				try {
-					return __US_success(value);
-				} catch (error) {
-					return __US_fail(error);
-				}
-			},
-			(error) => __US_fail(error),
-		);
+		return success(action(...args));
 	} catch (error) {
-		return __US_fail(error);
+		return fail(error);
 	}
-`);
 }
 
 async function executePageTaskInMainWorld(task, sender) {
@@ -428,16 +384,11 @@ async function executePageTaskInMainWorld(task, sender) {
 	if (typeof browser?.scripting?.executeScript !== "function") {
 		throw new Error("Page task transport is not available");
 	}
-	const func =
-		normalizedTask.kind === "getPageData"
-			? buildBackgroundPageDataExecutor(
-					normalizedTask.extractorSource,
-					normalizedTask.argsJson,
-				)
-			: buildBackgroundPageCallExecutor(
-					normalizedTask.operation,
-					normalizedTask.argsJson,
-				);
+	if (normalizedTask.kind === "getPageData") {
+		throw new Error(
+			"Secure GM.getPageData transport is not available on this platform; use GM.page.call instead",
+		);
+	}
 	let injectionResults;
 	try {
 		injectionResults = await browser.scripting.executeScript({
@@ -446,7 +397,19 @@ async function executePageTaskInMainWorld(task, sender) {
 				frameIds: [frameId],
 			},
 			world: "MAIN",
-			func,
+			func: executeMainWorldPageCallTask,
+			args: [
+				normalizedTask.operation,
+				normalizedTask.args,
+				{
+					maxDepth: BACKGROUND_PAGE_DATA_MAX_DEPTH,
+					maxArrayLength: BACKGROUND_PAGE_DATA_MAX_ARRAY_LENGTH,
+					maxObjectKeys: BACKGROUND_PAGE_DATA_MAX_OBJECT_KEYS,
+					maxObjectKeyLength: BACKGROUND_PAGE_DATA_MAX_OBJECT_KEY_LENGTH,
+					maxResultBytes: normalizedTask.maxResultBytes,
+					oversizedResultMessage: normalizedTask.oversizedResultMessage,
+				},
+			],
 		});
 	} catch (error) {
 		throw new Error(
