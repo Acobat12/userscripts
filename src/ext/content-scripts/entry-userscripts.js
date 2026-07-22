@@ -263,7 +263,7 @@ async function injection() {
 		if (grants.length > 0 && injectInto !== "content") {
 			userscript.forceContentInjection = true;
 			console.warn(
-				`${filename} has @grant values; forcing content injection. Use secure page APIs where supported, and prefer GM.page.call() for explicit page interactions.`,
+				`${filename} has @grant values; forcing content injection. Use GM.page.call() for page-context interactions.`,
 			);
 		}
 		// loop through each userscript @grant value, add methods as needed

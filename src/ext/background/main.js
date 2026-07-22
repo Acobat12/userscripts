@@ -37,9 +37,6 @@ const BACKGROUND_XHR_MAX_TIMEOUT_MS = 120_000;
 const BACKGROUND_XHR_MAX_HEADER_COUNT = 64;
 const BACKGROUND_XHR_MAX_HEADER_VALUE_LENGTH = 8192;
 const BACKGROUND_XHR_MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
-const BACKGROUND_PAGE_DATA_MAX_EXTRACTOR_BYTES = 100_000;
-const BACKGROUND_PAGE_DATA_MAX_ARGS_BYTES = 256 * 1024;
-const BACKGROUND_PAGE_DATA_MAX_RESULT_BYTES = 2 * 1024 * 1024;
 const BACKGROUND_PAGE_DATA_MAX_DEPTH = 32;
 const BACKGROUND_PAGE_DATA_MAX_ARRAY_LENGTH = 4096;
 const BACKGROUND_PAGE_DATA_MAX_OBJECT_KEYS = 128;
@@ -47,10 +44,87 @@ const BACKGROUND_PAGE_DATA_MAX_OBJECT_KEY_LENGTH = 512;
 const BACKGROUND_PAGE_CALL_MAX_ARGS_BYTES = 64 * 1024;
 const BACKGROUND_PAGE_CALL_MAX_RESULT_BYTES = 256 * 1024;
 const BACKGROUND_PAGE_CALL_MAX_OPERATION_LENGTH = 64;
+const BACKGROUND_PAGE_CALL_MAX_SELECTOR_LENGTH = 4096;
+const BACKGROUND_PAGE_CALL_MAX_ATTRIBUTE_LENGTH = 128;
+const BACKGROUND_PAGE_CALL_MAX_PROPERTY_LENGTH = 64;
+const BACKGROUND_PAGE_CALL_MAX_VALUE_LENGTH = 8192;
+const BACKGROUND_PAGE_CALL_MAX_EVENT_TYPE_LENGTH = 128;
+const BACKGROUND_PAGE_CALL_MAX_EVENT_STRING_LENGTH = 512;
+const BACKGROUND_PAGE_CALL_MAX_SNAPSHOT_QUERIES = 32;
+const BACKGROUND_PAGE_CALL_MAX_SNAPSHOT_KEY_LENGTH = 128;
 const BACKGROUND_PAGE_CALL_ALLOWED_OPERATIONS = new Set([
+	"dom.exists",
+	"dom.count",
 	"dom.queryText",
+	"dom.queryHtml",
+	"dom.queryOuterHtml",
+	"dom.queryAttr",
+	"dom.queryProperty",
+	"dom.queryRect",
+	"dom.queryClassList",
+	"dom.queryAllText",
+	"dom.queryAllAttr",
+	"dom.queryAllProperty",
 	"dom.click",
+	"dom.focus",
+	"dom.blur",
+	"dom.setValue",
+	"dom.setChecked",
+	"dom.setSelectedIndex",
 	"event.dispatch",
+	"page.getTitle",
+	"page.getLocation",
+	"page.getReadyState",
+	"page.getVisibility",
+	"page.getSelectionText",
+	"page.snapshot",
+]);
+const BACKGROUND_PAGE_CALL_ALLOWED_PROPERTIES = new Set([
+	"value",
+	"checked",
+	"disabled",
+	"selectedIndex",
+	"href",
+	"src",
+	"title",
+	"id",
+	"name",
+	"type",
+	"placeholder",
+	"lang",
+	"dir",
+	"textContent",
+	"innerText",
+	"className",
+	"ariaLabel",
+	"tabIndex",
+]);
+const BACKGROUND_PAGE_CALL_ALLOWED_LOCATION_FIELDS = Object.freeze([
+	"href",
+	"origin",
+	"protocol",
+	"host",
+	"hostname",
+	"pathname",
+	"search",
+	"hash",
+]);
+const BACKGROUND_PAGE_CALL_ALLOWED_LOCATION_FIELD_SET = new Set(
+	BACKGROUND_PAGE_CALL_ALLOWED_LOCATION_FIELDS,
+);
+const BACKGROUND_PAGE_CALL_ALLOWED_SNAPSHOT_QUERY_KINDS = new Set([
+	"text",
+	"html",
+	"outerHtml",
+	"attr",
+	"property",
+	"exists",
+	"rect",
+	"classList",
+	"allText",
+	"allAttr",
+	"allProperty",
+	"count",
 ]);
 const BACKGROUND_XHR_HANDLER_NAMES = new Set([
 	"onreadystatechange",
@@ -94,78 +168,629 @@ function backgroundIsPlainObject(value) {
 	}
 }
 
+function formatBackgroundPageTaskError(error, fallbackMessage = "Page task failed") {
+	if (typeof error?.stack === "string" && error.stack) {
+		return error.stack;
+	}
+	if (typeof error?.message === "string" && error.message) {
+		return error.message;
+	}
+	if (typeof error === "string" && error) {
+		return error;
+	}
+	return fallbackMessage;
+}
+
+function createBackgroundPageTaskConfig(maxResultBytes, oversizedResultMessage) {
+	return {
+		maxDepth: BACKGROUND_PAGE_DATA_MAX_DEPTH,
+		maxArrayLength: BACKGROUND_PAGE_DATA_MAX_ARRAY_LENGTH,
+		maxObjectKeys: BACKGROUND_PAGE_DATA_MAX_OBJECT_KEYS,
+		maxObjectKeyLength: BACKGROUND_PAGE_DATA_MAX_OBJECT_KEY_LENGTH,
+		maxResultBytes,
+		oversizedResultMessage,
+	};
+}
+
+function backgroundIsSafePageObjectKey(key) {
+	return (
+		key !== "__proto__" &&
+		key !== "prototype" &&
+		key !== "constructor"
+	);
+}
+
+function backgroundNormalizePageSerializableValue(
+	value,
+	depth = 0,
+	seen = new WeakSet(),
+) {
+	if (depth > BACKGROUND_PAGE_DATA_MAX_DEPTH) {
+		throw new Error("page value exceeds maximum depth");
+	}
+	if (value === null) return null;
+	switch (typeof value) {
+		case "string":
+		case "boolean":
+			return value;
+		case "number":
+			if (!Number.isFinite(value)) {
+				throw new Error("page numeric value must be finite");
+			}
+			return value;
+		case "object":
+			break;
+		default:
+			throw new Error("page value type is not supported");
+	}
+	if (seen.has(value)) {
+		throw new Error("page value must not contain cycles");
+	}
+	seen.add(value);
+	try {
+		if (Array.isArray(value)) {
+			if (value.length > BACKGROUND_PAGE_DATA_MAX_ARRAY_LENGTH) {
+				throw new Error("page array is too large");
+			}
+			return value.map((item) =>
+				backgroundNormalizePageSerializableValue(item, depth + 1, seen),
+			);
+		}
+		if (!backgroundIsPlainObject(value)) {
+			throw new Error("page object must be plain");
+		}
+		const result = Object.create(null);
+		const entries = Object.entries(value);
+		if (entries.length > BACKGROUND_PAGE_DATA_MAX_OBJECT_KEYS) {
+			throw new Error("page object has too many keys");
+		}
+		for (const [key, entryValue] of entries) {
+			if (key.length > BACKGROUND_PAGE_DATA_MAX_OBJECT_KEY_LENGTH) {
+				throw new Error("page object key is too long");
+			}
+			if (!backgroundIsSafePageObjectKey(key)) {
+				throw new Error("page object key is not allowed");
+			}
+			result[key] = backgroundNormalizePageSerializableValue(
+				entryValue,
+				depth + 1,
+				seen,
+			);
+		}
+		return result;
+	} finally {
+		seen.delete(value);
+	}
+}
+
+function backgroundNormalizePageCallString(value, label, maxLength = Infinity) {
+	if (typeof value !== "string" || !value.length) {
+		throw new Error(`${label} must be a non-empty string`);
+	}
+	if (value.length > maxLength) {
+		throw new Error(`${label} is too long`);
+	}
+	return value;
+}
+
+function backgroundNormalizePageCallInteger(value, label, minimum = -Infinity) {
+	if (!Number.isInteger(value) || value < minimum) {
+		throw new Error(`${label} must be an integer`);
+	}
+	return value;
+}
+
+function backgroundNormalizePageCallBoolean(value, label) {
+	if (typeof value !== "boolean") {
+		throw new Error(`${label} must be a boolean`);
+	}
+	return value;
+}
+
+function backgroundNormalizePageCallNumber(value, label) {
+	if (!Number.isFinite(value)) {
+		throw new Error(`${label} must be a finite number`);
+	}
+	return value;
+}
+
+function backgroundNormalizePageCallSelector(selector) {
+	if (typeof selector !== "string" || !selector.trim()) {
+		throw new Error("page.call selector must be a non-empty string");
+	}
+	if (selector.length > BACKGROUND_PAGE_CALL_MAX_SELECTOR_LENGTH) {
+		throw new Error("page.call selector is too long");
+	}
+	return selector;
+}
+
+function backgroundNormalizePageCallAttribute(attribute) {
+	if (typeof attribute !== "string" || !attribute.trim()) {
+		throw new Error("page.call attribute must be a non-empty string");
+	}
+	if (attribute.length > BACKGROUND_PAGE_CALL_MAX_ATTRIBUTE_LENGTH) {
+		throw new Error("page.call attribute is too long");
+	}
+	return attribute;
+}
+
+function backgroundNormalizePageCallProperty(property) {
+	const normalizedProperty = backgroundNormalizePageCallString(
+		property,
+		"page.call property",
+		BACKGROUND_PAGE_CALL_MAX_PROPERTY_LENGTH,
+	);
+	if (!BACKGROUND_PAGE_CALL_ALLOWED_PROPERTIES.has(normalizedProperty)) {
+		throw new Error(`DOM property is not allowed: ${normalizedProperty}`);
+	}
+	return normalizedProperty;
+}
+
+function backgroundNormalizePageCallValue(value) {
+	return backgroundNormalizePageCallString(
+		value,
+		"page.call value",
+		BACKGROUND_PAGE_CALL_MAX_VALUE_LENGTH,
+	);
+}
+
+function backgroundNormalizePageCallEventSpec(spec) {
+	const normalizedSpec = backgroundNormalizePageSerializableValue(spec);
+	if (!backgroundIsPlainObject(normalizedSpec)) {
+		throw new Error("page.call event spec must be a plain object");
+	}
+	const hasOwn = (key) =>
+		Object.prototype.hasOwnProperty.call(normalizedSpec, key);
+	const kind = hasOwn("kind")
+		? backgroundNormalizePageCallString(
+				normalizedSpec.kind,
+				"page.call event kind",
+				BACKGROUND_PAGE_CALL_MAX_EVENT_STRING_LENGTH,
+			)
+		: "event";
+	if (!new Set(["event", "custom", "mouse", "keyboard", "input"]).has(kind)) {
+		throw new Error(`page.call unsupported event kind: ${kind}`);
+	}
+	const type = backgroundNormalizePageCallString(
+		normalizedSpec.type,
+		"page.call event type",
+		BACKGROUND_PAGE_CALL_MAX_EVENT_TYPE_LENGTH,
+	);
+	const allowedKeys = new Set(["kind", "type", "bubbles", "cancelable", "composed"]);
+	if (kind === "custom") {
+		allowedKeys.add("detail");
+	} else if (kind === "mouse") {
+		for (const key of [
+			"button",
+			"buttons",
+			"clientX",
+			"clientY",
+			"screenX",
+			"screenY",
+			"ctrlKey",
+			"shiftKey",
+			"altKey",
+			"metaKey",
+		]) {
+			allowedKeys.add(key);
+		}
+	} else if (kind === "keyboard") {
+		for (const key of [
+			"key",
+			"code",
+			"location",
+			"repeat",
+			"ctrlKey",
+			"shiftKey",
+			"altKey",
+			"metaKey",
+		]) {
+			allowedKeys.add(key);
+		}
+	} else if (kind === "input") {
+		for (const key of ["data", "inputType", "isComposing"]) {
+			allowedKeys.add(key);
+		}
+	}
+	for (const key of Object.keys(normalizedSpec)) {
+		if (!allowedKeys.has(key)) {
+			throw new Error(`page.call event spec key is not allowed: ${key}`);
+		}
+	}
+	const result = Object.create(null);
+	result.kind = kind;
+	result.type = type;
+	if (hasOwn("bubbles")) {
+		result.bubbles = backgroundNormalizePageCallBoolean(
+			normalizedSpec.bubbles,
+			"page.call event bubbles",
+		);
+	}
+	if (hasOwn("cancelable")) {
+		result.cancelable = backgroundNormalizePageCallBoolean(
+			normalizedSpec.cancelable,
+			"page.call event cancelable",
+		);
+	}
+	if (hasOwn("composed")) {
+		result.composed = backgroundNormalizePageCallBoolean(
+			normalizedSpec.composed,
+			"page.call event composed",
+		);
+	}
+	if (kind === "custom" && hasOwn("detail")) {
+		result.detail = normalizedSpec.detail;
+	}
+	if (kind === "mouse") {
+		for (const key of ["button", "buttons", "clientX", "clientY", "screenX", "screenY"]) {
+			if (hasOwn(key)) {
+				result[key] = backgroundNormalizePageCallNumber(
+					normalizedSpec[key],
+					`page.call event ${key}`,
+				);
+			}
+		}
+		for (const key of ["ctrlKey", "shiftKey", "altKey", "metaKey"]) {
+			if (hasOwn(key)) {
+				result[key] = backgroundNormalizePageCallBoolean(
+					normalizedSpec[key],
+					`page.call event ${key}`,
+				);
+			}
+		}
+	}
+	if (kind === "keyboard") {
+		for (const key of ["key", "code"]) {
+			if (hasOwn(key)) {
+				result[key] = backgroundNormalizePageCallString(
+					normalizedSpec[key],
+					`page.call event ${key}`,
+					BACKGROUND_PAGE_CALL_MAX_EVENT_STRING_LENGTH,
+				);
+			}
+		}
+		if (hasOwn("location")) {
+			result.location = backgroundNormalizePageCallNumber(
+				normalizedSpec.location,
+				"page.call event location",
+			);
+		}
+		for (const key of ["repeat", "ctrlKey", "shiftKey", "altKey", "metaKey"]) {
+			if (hasOwn(key)) {
+				result[key] = backgroundNormalizePageCallBoolean(
+					normalizedSpec[key],
+					`page.call event ${key}`,
+				);
+			}
+		}
+	}
+	if (kind === "input") {
+		for (const key of ["data", "inputType"]) {
+			if (hasOwn(key)) {
+				result[key] = backgroundNormalizePageCallString(
+					normalizedSpec[key],
+					`page.call event ${key}`,
+					BACKGROUND_PAGE_CALL_MAX_EVENT_STRING_LENGTH,
+				);
+			}
+		}
+		if (hasOwn("isComposing")) {
+			result.isComposing = backgroundNormalizePageCallBoolean(
+				normalizedSpec.isComposing,
+				"page.call event isComposing",
+			);
+		}
+	}
+	return result;
+}
+
+function backgroundNormalizePageCallLocationFields(locationValue) {
+	if (locationValue === true) {
+		return [...BACKGROUND_PAGE_CALL_ALLOWED_LOCATION_FIELDS];
+	}
+	if (!Array.isArray(locationValue) || locationValue.length === 0) {
+		throw new Error(
+			"page.call page.snapshot location must be true or a non-empty array",
+		);
+	}
+	const fields = [];
+	const seen = new Set();
+	for (const value of locationValue) {
+		const field = backgroundNormalizePageCallString(
+			value,
+			"page.call location field",
+			BACKGROUND_PAGE_CALL_MAX_PROPERTY_LENGTH,
+		);
+		if (!BACKGROUND_PAGE_CALL_ALLOWED_LOCATION_FIELD_SET.has(field)) {
+			throw new Error(`page.call location field is not allowed: ${field}`);
+		}
+		if (seen.has(field)) continue;
+		seen.add(field);
+		fields.push(field);
+	}
+	return fields;
+}
+
+function backgroundNormalizePageCallSnapshotQuerySpec(spec) {
+	const normalizedSpec = backgroundNormalizePageSerializableValue(spec);
+	if (!backgroundIsPlainObject(normalizedSpec)) {
+		throw new Error("page.call page.snapshot query spec must be a plain object");
+	}
+	const kind = backgroundNormalizePageCallString(
+		normalizedSpec.kind,
+		"page.call page.snapshot query kind",
+		BACKGROUND_PAGE_CALL_MAX_EVENT_STRING_LENGTH,
+	);
+	if (!BACKGROUND_PAGE_CALL_ALLOWED_SNAPSHOT_QUERY_KINDS.has(kind)) {
+		throw new Error(`page.call page.snapshot query kind is not allowed: ${kind}`);
+	}
+	const result = Object.create(null);
+	result.kind = kind;
+	result.selector = backgroundNormalizePageCallSelector(normalizedSpec.selector);
+	if (
+		["text", "html", "outerHtml", "exists", "rect", "classList", "allText", "count"].includes(
+			kind,
+		)
+	) {
+		if (Object.keys(normalizedSpec).some((key) => !["kind", "selector"].includes(key))) {
+			throw new Error(
+				`page.call page.snapshot ${kind} query has unsupported keys`,
+			);
+		}
+		return result;
+	}
+	if (["attr", "allAttr"].includes(kind)) {
+		if (
+			Object.keys(normalizedSpec).some(
+				(key) => !["kind", "selector", "attribute"].includes(key),
+			)
+		) {
+			throw new Error(
+				`page.call page.snapshot ${kind} query has unsupported keys`,
+			);
+		}
+		result.attribute = backgroundNormalizePageCallAttribute(normalizedSpec.attribute);
+		return result;
+	}
+	if (["property", "allProperty"].includes(kind)) {
+		if (
+			Object.keys(normalizedSpec).some(
+				(key) => !["kind", "selector", "property"].includes(key),
+			)
+		) {
+			throw new Error(
+				`page.call page.snapshot ${kind} query has unsupported keys`,
+			);
+		}
+		result.property = backgroundNormalizePageCallProperty(normalizedSpec.property);
+		return result;
+	}
+	if (
+		Object.keys(normalizedSpec).some(
+			(key) => !["kind", "selector"].includes(key),
+		)
+	) {
+		throw new Error(`page.call page.snapshot ${kind} query has unsupported keys`);
+	}
+	return result;
+}
+
+function backgroundNormalizePageCallSnapshotSpec(spec) {
+	const normalizedSpec = backgroundNormalizePageSerializableValue(spec);
+	if (!backgroundIsPlainObject(normalizedSpec)) {
+		throw new Error("page.call page.snapshot spec must be a plain object");
+	}
+	const allowedKeys = new Set([
+		"title",
+		"location",
+		"readyState",
+		"visibility",
+		"selectionText",
+		"queries",
+	]);
+	for (const key of Object.keys(normalizedSpec)) {
+		if (!allowedKeys.has(key)) {
+			throw new Error(`page.call page.snapshot spec key is not allowed: ${key}`);
+		}
+	}
+	const hasOwn = (key) =>
+		Object.prototype.hasOwnProperty.call(normalizedSpec, key);
+	const result = Object.create(null);
+	if (hasOwn("title")) {
+		result.title = backgroundNormalizePageCallBoolean(
+			normalizedSpec.title,
+			"page.call page.snapshot title",
+		);
+	}
+	if (hasOwn("location")) {
+		result.location = backgroundNormalizePageCallLocationFields(
+			normalizedSpec.location,
+		);
+	}
+	if (hasOwn("readyState")) {
+		result.readyState = backgroundNormalizePageCallBoolean(
+			normalizedSpec.readyState,
+			"page.call page.snapshot readyState",
+		);
+	}
+	if (hasOwn("visibility")) {
+		result.visibility = backgroundNormalizePageCallBoolean(
+			normalizedSpec.visibility,
+			"page.call page.snapshot visibility",
+		);
+	}
+	if (hasOwn("selectionText")) {
+		result.selectionText = backgroundNormalizePageCallBoolean(
+			normalizedSpec.selectionText,
+			"page.call page.snapshot selectionText",
+		);
+	}
+	if (hasOwn("queries")) {
+		const queries = normalizedSpec.queries;
+		if (!backgroundIsPlainObject(queries)) {
+			throw new Error("page.call page.snapshot queries must be a plain object");
+		}
+		const entries = Object.entries(queries);
+		if (entries.length > BACKGROUND_PAGE_CALL_MAX_SNAPSHOT_QUERIES) {
+			throw new Error("page.call page.snapshot has too many queries");
+		}
+		const normalizedQueries = Object.create(null);
+		for (const [key, value] of entries) {
+			if (!key.length) {
+				throw new Error("page.call page.snapshot query key must not be empty");
+			}
+			if (key.length > BACKGROUND_PAGE_CALL_MAX_SNAPSHOT_KEY_LENGTH) {
+				throw new Error("page.call page.snapshot query key is too long");
+			}
+			if (!backgroundIsSafePageObjectKey(key)) {
+				throw new Error("page.call page.snapshot query key is not allowed");
+			}
+			normalizedQueries[key] = backgroundNormalizePageCallSnapshotQuerySpec(value);
+		}
+		result.queries = normalizedQueries;
+	}
+	if (!Object.keys(result).length) {
+		throw new Error("page.call page.snapshot spec must request at least one field");
+	}
+	return result;
+}
+
+function backgroundNormalizePageCallArgs(operation, args) {
+	if (!Array.isArray(args)) {
+		throw new Error("page.call arguments must be an array");
+	}
+	switch (operation) {
+		case "dom.exists":
+		case "dom.count":
+		case "dom.queryText":
+		case "dom.queryHtml":
+		case "dom.queryOuterHtml":
+		case "dom.queryRect":
+		case "dom.queryClassList":
+		case "dom.queryAllText":
+		case "dom.click":
+		case "dom.focus":
+		case "dom.blur":
+			if (args.length !== 1) {
+				throw new Error(`page.call ${operation} expects exactly 1 argument`);
+			}
+			return [backgroundNormalizePageCallSelector(args[0])];
+		case "dom.queryAttr":
+		case "dom.queryAllAttr":
+			if (args.length !== 2) {
+				throw new Error(`page.call ${operation} expects exactly 2 arguments`);
+			}
+			return [
+				backgroundNormalizePageCallSelector(args[0]),
+				backgroundNormalizePageCallAttribute(args[1]),
+			];
+		case "dom.queryProperty":
+		case "dom.queryAllProperty":
+			if (args.length !== 2) {
+				throw new Error(`page.call ${operation} expects exactly 2 arguments`);
+			}
+			return [
+				backgroundNormalizePageCallSelector(args[0]),
+				backgroundNormalizePageCallProperty(args[1]),
+			];
+		case "dom.setValue":
+			if (args.length !== 2) {
+				throw new Error("page.call dom.setValue expects exactly 2 arguments");
+			}
+			return [
+				backgroundNormalizePageCallSelector(args[0]),
+				backgroundNormalizePageCallValue(args[1]),
+			];
+		case "dom.setChecked":
+			if (args.length !== 2) {
+				throw new Error("page.call dom.setChecked expects exactly 2 arguments");
+			}
+			return [
+				backgroundNormalizePageCallSelector(args[0]),
+				backgroundNormalizePageCallBoolean(args[1], "page.call checked"),
+			];
+		case "dom.setSelectedIndex":
+			if (args.length !== 2) {
+				throw new Error(
+					"page.call dom.setSelectedIndex expects exactly 2 arguments",
+				);
+			}
+			return [
+				backgroundNormalizePageCallSelector(args[0]),
+				backgroundNormalizePageCallInteger(
+					args[1],
+					"page.call selectedIndex",
+					-1,
+				),
+			];
+		case "event.dispatch":
+			if (args.length !== 2) {
+				throw new Error("page.call event.dispatch expects exactly 2 arguments");
+			}
+			return [
+				backgroundNormalizePageCallSelector(args[0]),
+				backgroundNormalizePageCallEventSpec(args[1]),
+			];
+		case "page.getTitle":
+		case "page.getLocation":
+		case "page.getReadyState":
+		case "page.getVisibility":
+		case "page.getSelectionText":
+			if (args.length !== 0) {
+				throw new Error(`page.call ${operation} expects exactly 0 arguments`);
+			}
+			return [];
+		case "page.snapshot":
+			if (args.length !== 1) {
+				throw new Error("page.call page.snapshot expects exactly 1 argument");
+			}
+			return [backgroundNormalizePageCallSnapshotSpec(args[0])];
+		default:
+			throw new Error(`Unsupported page operation: ${operation}`);
+	}
+}
+
 function normalizeBackgroundPageTask(task) {
 	if (!backgroundIsPlainObject(task)) {
 		throw new Error("Invalid page task");
 	}
 	if (task.kind === "getPageData") {
-		if (typeof task.extractorSource !== "string" || !task.extractorSource.length) {
-			throw new Error("Invalid page data extractor");
-		}
-		if (
-			backgroundByteLength(task.extractorSource) >
-			BACKGROUND_PAGE_DATA_MAX_EXTRACTOR_BYTES
-		) {
-			throw new Error("Page data extractor is too large");
-		}
-		if (typeof task.argsJson !== "string") {
-			throw new Error("Invalid page data arguments");
-		}
-		if (backgroundByteLength(task.argsJson) > BACKGROUND_PAGE_DATA_MAX_ARGS_BYTES) {
-			throw new Error("Page data arguments are too large");
-		}
-		let parsedArgs;
-		try {
-			parsedArgs = JSON.parse(task.argsJson);
-		} catch {
-			throw new Error("Invalid page data arguments");
-		}
-		if (!Array.isArray(parsedArgs)) {
-			throw new Error("Page data arguments must be an array");
-		}
-		return {
-			kind: task.kind,
-			argsJson: JSON.stringify(parsedArgs),
-			extractorSource: task.extractorSource,
-			maxResultBytes: BACKGROUND_PAGE_DATA_MAX_RESULT_BYTES,
-			oversizedResultMessage: "Page data result is too large",
-		};
+		throw new Error(
+			"GM.getPageData(extractor) is no longer supported. Use GM.page.call(operation, ...args).",
+		);
 	}
-	if (task.kind === "pageCall") {
-		if (
-			typeof task.operation !== "string" ||
-			!task.operation.length ||
-			task.operation.length > BACKGROUND_PAGE_CALL_MAX_OPERATION_LENGTH
-		) {
-			throw new Error("Invalid page operation");
-		}
-		if (!BACKGROUND_PAGE_CALL_ALLOWED_OPERATIONS.has(task.operation)) {
-			throw new Error("Unsupported page operation");
-		}
-		if (typeof task.argsJson !== "string") {
-			throw new Error("Invalid page.call arguments");
-		}
-		if (backgroundByteLength(task.argsJson) > BACKGROUND_PAGE_CALL_MAX_ARGS_BYTES) {
-			throw new Error("page.call arguments are too large");
-		}
-		let parsedArgs;
-		try {
-			parsedArgs = JSON.parse(task.argsJson);
-		} catch {
-			throw new Error("Invalid page.call arguments");
-		}
-		if (!Array.isArray(parsedArgs)) {
-			throw new Error("page.call arguments must be an array");
-		}
-		return {
-			kind: task.kind,
-			args: parsedArgs,
-			maxResultBytes: BACKGROUND_PAGE_CALL_MAX_RESULT_BYTES,
-			operation: task.operation,
-			oversizedResultMessage: "page.call result is too large",
-		};
+	if (task.kind !== "pageCall") {
+		throw new Error("Unsupported page task");
 	}
-	throw new Error("Unsupported page task");
+	if (
+		typeof task.operation !== "string" ||
+		!task.operation.length ||
+		task.operation.length > BACKGROUND_PAGE_CALL_MAX_OPERATION_LENGTH
+	) {
+		throw new Error("Invalid page operation");
+	}
+	if (!BACKGROUND_PAGE_CALL_ALLOWED_OPERATIONS.has(task.operation)) {
+		throw new Error("Unsupported page operation");
+	}
+	if (typeof task.argsJson !== "string") {
+		throw new Error("Invalid page.call arguments");
+	}
+	if (backgroundByteLength(task.argsJson) > BACKGROUND_PAGE_CALL_MAX_ARGS_BYTES) {
+		throw new Error("page.call arguments are too large");
+	}
+	let parsedArgs;
+	try {
+		parsedArgs = JSON.parse(task.argsJson);
+	} catch {
+		throw new Error("Invalid page.call arguments");
+	}
+	return {
+		kind: task.kind,
+		args: backgroundNormalizePageCallArgs(task.operation, parsedArgs),
+		maxResultBytes: BACKGROUND_PAGE_CALL_MAX_RESULT_BYTES,
+		operation: task.operation,
+		oversizedResultMessage: "page.call result is too large",
+	};
 }
 
 function executeMainWorldPageCallTask(
@@ -276,6 +901,59 @@ function executeMainWorldPageCallTask(
 		}
 		return document.querySelector(selector);
 	};
+	const selectTargets = (selector) => {
+		if (typeof selector !== "string" || !selector) {
+			throw new Error("Invalid page selector");
+		}
+		return Array.from(document.querySelectorAll(selector));
+	};
+	const readText = (target) => (target ? String(target.textContent ?? "") : null);
+	const readHtml = (target) => (target ? String(target.innerHTML ?? "") : null);
+	const readOuterHtml = (target) =>
+		(target ? String(target.outerHTML ?? "") : null);
+	const readAttribute = (target, attribute) => {
+		if (!target || typeof target.getAttribute !== "function") {
+			return null;
+		}
+		return target.getAttribute(attribute);
+	};
+	const readProperty = (target, property) =>
+		(target ? target[property] ?? null : null);
+	const readRect = (target) => {
+		if (!target || typeof target.getBoundingClientRect !== "function") {
+			return null;
+		}
+		const rect = target.getBoundingClientRect();
+		if (!rect) {
+			return null;
+		}
+		return {
+			x: Number(rect.x ?? 0),
+			y: Number(rect.y ?? 0),
+			width: Number(rect.width ?? 0),
+			height: Number(rect.height ?? 0),
+			top: Number(rect.top ?? 0),
+			right: Number(rect.right ?? 0),
+			bottom: Number(rect.bottom ?? 0),
+			left: Number(rect.left ?? 0),
+		};
+	};
+	const readClassList = (target) => {
+		if (!target) {
+			return null;
+		}
+		if (target.classList && typeof target.classList[Symbol.iterator] === "function") {
+			return Array.from(target.classList, (token) => String(token));
+		}
+		if (typeof target.className === "string") {
+			return target.className.split(/\s+/).filter(Boolean);
+		}
+		return [];
+	};
+	const readSelectionText = () => {
+		const selection = globalThis.getSelection?.();
+		return selection ? String(selection.toString()) : "";
+	};
 	const buildEvent = (spec) => {
 		if (!spec || typeof spec !== "object" || Array.isArray(spec)) {
 			throw new Error("Invalid event spec");
@@ -339,9 +1017,75 @@ function executeMainWorldPageCallTask(
 		}
 	};
 	const operations = {
+		"dom.exists": (selector) => Boolean(selectTarget(selector)),
+		"dom.count": (selector) => selectTargets(selector).length,
 		"dom.queryText": (selector) => {
 			const target = selectTarget(selector);
-			return target ? String(target.textContent ?? "") : null;
+			return readText(target);
+		},
+		"dom.queryHtml": (selector) => {
+			const target = selectTarget(selector);
+			return readHtml(target);
+		},
+		"dom.queryOuterHtml": (selector) => {
+			const target = selectTarget(selector);
+			return readOuterHtml(target);
+		},
+		"dom.queryAttr": (selector, attribute) => {
+			const target = selectTarget(selector);
+			return readAttribute(target, attribute);
+		},
+		"dom.queryProperty": (selector, property) => {
+			const target = selectTarget(selector);
+			return readProperty(target, property);
+		},
+		"dom.queryRect": (selector) => {
+			const target = selectTarget(selector);
+			return readRect(target);
+		},
+		"dom.queryClassList": (selector) => {
+			const target = selectTarget(selector);
+			return readClassList(target);
+		},
+		"dom.queryAllText": (selector) =>
+			selectTargets(selector).map((target) => readText(target)),
+		"dom.queryAllAttr": (selector, attribute) =>
+			selectTargets(selector).map((target) => readAttribute(target, attribute)),
+		"dom.queryAllProperty": (selector, property) =>
+			selectTargets(selector).map((target) => readProperty(target, property)),
+		"dom.focus": (selector) => {
+			const target = selectTarget(selector);
+			if (!target || typeof target.focus !== "function") {
+				return false;
+			}
+			target.focus();
+			return true;
+		},
+		"dom.blur": (selector) => {
+			const target = selectTarget(selector);
+			if (!target || typeof target.blur !== "function") {
+				return false;
+			}
+			target.blur();
+			return true;
+		},
+		"dom.setValue": (selector, value) => {
+			const target = selectTarget(selector);
+			if (!target) return false;
+			target.value = value;
+			return true;
+		},
+		"dom.setChecked": (selector, checked) => {
+			const target = selectTarget(selector);
+			if (!target) return false;
+			target.checked = checked;
+			return true;
+		},
+		"dom.setSelectedIndex": (selector, selectedIndex) => {
+			const target = selectTarget(selector);
+			if (!target) return false;
+			target.selectedIndex = selectedIndex;
+			return true;
 		},
 		"dom.click": (selector) => {
 			const target = selectTarget(selector);
@@ -361,6 +1105,104 @@ function executeMainWorldPageCallTask(
 			const target = selectTarget(selector);
 			if (!target) return false;
 			return target.dispatchEvent(buildEvent(spec));
+		},
+		"page.getTitle": () => String(document.title ?? ""),
+		"page.getLocation": () => {
+			const result = Object.create(null);
+			for (const field of [
+				"href",
+				"origin",
+				"protocol",
+				"host",
+				"hostname",
+				"pathname",
+				"search",
+				"hash",
+			]) {
+				result[field] = String(globalThis.location?.[field] ?? "");
+			}
+			return result;
+		},
+		"page.getReadyState": () => String(document.readyState ?? ""),
+		"page.getVisibility": () => ({
+			hidden: Boolean(document.hidden),
+			visibilityState: String(document.visibilityState ?? ""),
+		}),
+		"page.getSelectionText": () => readSelectionText(),
+		"page.snapshot": (spec) => {
+			const runSnapshotQuery = (querySpec) => {
+				switch (querySpec.kind) {
+					case "text":
+						return operations["dom.queryText"](querySpec.selector);
+					case "html":
+						return operations["dom.queryHtml"](querySpec.selector);
+					case "outerHtml":
+						return operations["dom.queryOuterHtml"](querySpec.selector);
+					case "attr":
+						return operations["dom.queryAttr"](
+							querySpec.selector,
+							querySpec.attribute,
+						);
+					case "property":
+						return operations["dom.queryProperty"](
+							querySpec.selector,
+							querySpec.property,
+						);
+					case "exists":
+						return operations["dom.exists"](querySpec.selector);
+					case "rect":
+						return operations["dom.queryRect"](querySpec.selector);
+					case "classList":
+						return operations["dom.queryClassList"](querySpec.selector);
+					case "allText":
+						return operations["dom.queryAllText"](querySpec.selector);
+					case "allAttr":
+						return operations["dom.queryAllAttr"](
+							querySpec.selector,
+							querySpec.attribute,
+						);
+					case "allProperty":
+						return operations["dom.queryAllProperty"](
+							querySpec.selector,
+							querySpec.property,
+						);
+					case "count":
+						return operations["dom.count"](querySpec.selector);
+					default:
+						throw new Error("Unsupported page.snapshot query kind");
+				}
+			};
+			const result = Object.create(null);
+			if (spec.title === true) {
+				result.title = String(document.title ?? "");
+			}
+			if (Array.isArray(spec.location)) {
+				const locationResult = Object.create(null);
+				for (const field of spec.location) {
+					locationResult[field] = String(globalThis.location?.[field] ?? "");
+				}
+				result.location = locationResult;
+			}
+			if (spec.readyState === true) {
+				result.readyState = String(document.readyState ?? "");
+			}
+			if (spec.visibility === true) {
+				result.visibility = {
+					hidden: Boolean(document.hidden),
+					visibilityState: String(document.visibilityState ?? ""),
+				};
+			}
+			if (spec.selectionText === true) {
+				result.selectionText = readSelectionText();
+			}
+			if (spec.queries && typeof spec.queries === "object") {
+				const queryResults = Object.create(null);
+				for (const [key, querySpec] of Object.entries(spec.queries)) {
+					queryResults[key] = runSnapshotQuery(querySpec);
+				}
+				result.queries = queryResults;
+			}
+			return result;
 		},
 	};
 	try {
@@ -384,11 +1226,10 @@ async function executePageTaskInMainWorld(task, sender) {
 	if (typeof browser?.scripting?.executeScript !== "function") {
 		throw new Error("Page task transport is not available");
 	}
-	if (normalizedTask.kind === "getPageData") {
-		throw new Error(
-			"Secure GM.getPageData transport is not available on this platform; use GM.page.call instead",
-		);
-	}
+	const config = createBackgroundPageTaskConfig(
+		normalizedTask.maxResultBytes,
+		normalizedTask.oversizedResultMessage,
+	);
 	let injectionResults;
 	try {
 		injectionResults = await browser.scripting.executeScript({
@@ -401,19 +1242,12 @@ async function executePageTaskInMainWorld(task, sender) {
 			args: [
 				normalizedTask.operation,
 				normalizedTask.args,
-				{
-					maxDepth: BACKGROUND_PAGE_DATA_MAX_DEPTH,
-					maxArrayLength: BACKGROUND_PAGE_DATA_MAX_ARRAY_LENGTH,
-					maxObjectKeys: BACKGROUND_PAGE_DATA_MAX_OBJECT_KEYS,
-					maxObjectKeyLength: BACKGROUND_PAGE_DATA_MAX_OBJECT_KEY_LENGTH,
-					maxResultBytes: normalizedTask.maxResultBytes,
-					oversizedResultMessage: normalizedTask.oversizedResultMessage,
-				},
+				config,
 			],
 		});
 	} catch (error) {
 		throw new Error(
-			String(error?.message || error || "Page task transport failed"),
+			formatBackgroundPageTaskError(error, "Page task transport failed"),
 		);
 	}
 	const [injectionResult] = Array.isArray(injectionResults) ? injectionResults : [];
@@ -424,8 +1258,9 @@ async function executePageTaskInMainWorld(task, sender) {
 		return {
 			transport: "scripting.executeScript",
 			ok: false,
-			error: String(
-				injectionResult.error?.message || injectionResult.error || "Page task failed",
+			error: formatBackgroundPageTaskError(
+				injectionResult.error,
+				"Page task failed",
 			),
 		};
 	}

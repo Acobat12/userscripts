@@ -101,31 +101,51 @@ const XHR_FORBIDDEN_HEADER_PREFIXES = ["proxy-", "sec-"];
 const XHR_MAX_TIMEOUT_MS = 120_000;
 const XHR_MAX_HEADER_VALUE_LENGTH = 8192;
 const XHR_MAX_HEADER_COUNT = 64;
-const PAGE_DATA_TIMEOUT_MS = 5000;
-const PAGE_DATA_MAX_EXTRACTOR_BYTES = 100_000;
-const PAGE_DATA_MAX_ARGS_BYTES = 256 * 1024;
-const PAGE_DATA_MAX_RESULT_BYTES = 2 * 1024 * 1024;
-const PAGE_DATA_MAX_DEPTH = 32;
-const PAGE_DATA_MAX_ARRAY_LENGTH = 4096;
-const PAGE_DATA_MAX_OBJECT_KEYS = 128;
-const PAGE_DATA_MAX_OBJECT_KEY_LENGTH = 512;
-const PAGE_DATA_MAX_CALLS_PER_WINDOW = 20;
-const PAGE_DATA_RATE_WINDOW_MS = 1000;
-const PAGE_DATA_MAX_ACTIVE_CALLS = 8;
+const PAGE_SERIALIZABLE_MAX_DEPTH = 32;
+const PAGE_SERIALIZABLE_MAX_ARRAY_LENGTH = 4096;
+const PAGE_SERIALIZABLE_MAX_OBJECT_KEYS = 128;
+const PAGE_SERIALIZABLE_MAX_OBJECT_KEY_LENGTH = 512;
 const PAGE_CALL_TIMEOUT_MS = 5000;
 const PAGE_CALL_MAX_ARGS_BYTES = 64 * 1024;
 const PAGE_CALL_MAX_RESULT_BYTES = 256 * 1024;
 const PAGE_CALL_MAX_OPERATION_LENGTH = 64;
 const PAGE_CALL_MAX_SELECTOR_LENGTH = 4096;
+const PAGE_CALL_MAX_ATTRIBUTE_LENGTH = 128;
+const PAGE_CALL_MAX_PROPERTY_LENGTH = 64;
+const PAGE_CALL_MAX_VALUE_LENGTH = 8192;
 const PAGE_CALL_MAX_EVENT_TYPE_LENGTH = 128;
 const PAGE_CALL_MAX_EVENT_STRING_LENGTH = 512;
+const PAGE_CALL_MAX_SNAPSHOT_QUERIES = 32;
+const PAGE_CALL_MAX_SNAPSHOT_KEY_LENGTH = 128;
 const PAGE_CALL_MAX_CALLS_PER_WINDOW = 20;
 const PAGE_CALL_RATE_WINDOW_MS = 1000;
 const PAGE_CALL_MAX_ACTIVE_CALLS = 8;
 const PAGE_CALL_ALLOWED_OPERATIONS = new Set([
+	"dom.exists",
+	"dom.count",
 	"dom.queryText",
+	"dom.queryHtml",
+	"dom.queryOuterHtml",
+	"dom.queryAttr",
+	"dom.queryProperty",
+	"dom.queryRect",
+	"dom.queryClassList",
+	"dom.queryAllText",
+	"dom.queryAllAttr",
+	"dom.queryAllProperty",
 	"dom.click",
+	"dom.focus",
+	"dom.blur",
+	"dom.setValue",
+	"dom.setChecked",
+	"dom.setSelectedIndex",
 	"event.dispatch",
+	"page.getTitle",
+	"page.getLocation",
+	"page.getReadyState",
+	"page.getVisibility",
+	"page.getSelectionText",
+	"page.snapshot",
 ]);
 const PAGE_CALL_ALLOWED_EVENT_KINDS = new Set([
 	"event",
@@ -134,13 +154,53 @@ const PAGE_CALL_ALLOWED_EVENT_KINDS = new Set([
 	"keyboard",
 	"input",
 ]);
+const PAGE_CALL_ALLOWED_PROPERTIES = new Set([
+	"value",
+	"checked",
+	"disabled",
+	"selectedIndex",
+	"href",
+	"src",
+	"title",
+	"id",
+	"name",
+	"type",
+	"placeholder",
+	"lang",
+	"dir",
+	"textContent",
+	"innerText",
+	"className",
+	"ariaLabel",
+	"tabIndex",
+]);
+const PAGE_CALL_ALLOWED_LOCATION_FIELDS = Object.freeze([
+	"href",
+	"origin",
+	"protocol",
+	"host",
+	"hostname",
+	"pathname",
+	"search",
+	"hash",
+]);
+const PAGE_CALL_ALLOWED_LOCATION_FIELD_SET = new Set(PAGE_CALL_ALLOWED_LOCATION_FIELDS);
+const PAGE_CALL_ALLOWED_SNAPSHOT_QUERY_KINDS = new Set([
+	"text",
+	"html",
+	"outerHtml",
+	"attr",
+	"property",
+	"exists",
+	"rect",
+	"classList",
+	"allText",
+	"allAttr",
+	"allProperty",
+	"count",
+]);
 const pageDataTextEncoder =
 	typeof TextEncoder === "function" ? new TextEncoder() : null;
-const safeFunctionToString = Function.prototype.call.bind(
-	Function.prototype.toString,
-);
-const pageDataCallTimes = [];
-let pageDataActiveCalls = 0;
 const pageCallTimes = [];
 let pageCallActiveCalls = 0;
 
@@ -167,7 +227,7 @@ function pageDataByteLength(value) {
 	return text.length * 2;
 }
 
-function isPageDataPlainObject(value) {
+function isPageSerializablePlainObject(value) {
 	if (value == null || typeof value !== "object" || Array.isArray(value)) {
 		return false;
 	}
@@ -179,35 +239,12 @@ function isPageDataPlainObject(value) {
 	}
 }
 
-function isSafePageDataObjectKey(key) {
+function isSafePageSerializableObjectKey(key) {
 	return (
 		key !== "__proto__" &&
 		key !== "prototype" &&
 		key !== "constructor"
 	);
-}
-
-function reservePageDataCall() {
-	const now = Date.now();
-	while (
-		pageDataCallTimes.length &&
-		now - pageDataCallTimes[0] >= PAGE_DATA_RATE_WINDOW_MS
-	) {
-		pageDataCallTimes.shift();
-	}
-	if (pageDataCallTimes.length >= PAGE_DATA_MAX_CALLS_PER_WINDOW) {
-		throw new Error("getPageData rate limit exceeded");
-	}
-	if (pageDataActiveCalls >= PAGE_DATA_MAX_ACTIVE_CALLS) {
-		throw new Error("getPageData has too many active calls");
-	}
-	pageDataCallTimes.push(now);
-	pageDataActiveCalls += 1;
-	return () => {
-		if (pageDataActiveCalls > 0) {
-			pageDataActiveCalls -= 1;
-		}
-	};
 }
 
 function reservePageCall() {
@@ -326,8 +363,8 @@ function normalizePageDataSerializableValue(
 	depth = 0,
 	seen = new WeakSet(),
 ) {
-	if (depth > PAGE_DATA_MAX_DEPTH) {
-		throw new Error("getPageData value exceeds maximum depth");
+	if (depth > PAGE_SERIALIZABLE_MAX_DEPTH) {
+		throw new Error("page value exceeds maximum depth");
 	}
 	if (value === null) return null;
 	switch (typeof value) {
@@ -336,41 +373,41 @@ function normalizePageDataSerializableValue(
 			return value;
 		case "number":
 			if (!Number.isFinite(value)) {
-				throw new Error("getPageData numeric value must be finite");
+				throw new Error("page numeric value must be finite");
 			}
 			return value;
 		case "object":
 			break;
 		default:
-			throw new Error("getPageData value type is not supported");
+			throw new Error("page value type is not supported");
 	}
 	if (seen.has(value)) {
-		throw new Error("getPageData value must not contain cycles");
+		throw new Error("page value must not contain cycles");
 	}
 	seen.add(value);
 	try {
 		if (Array.isArray(value)) {
-			if (value.length > PAGE_DATA_MAX_ARRAY_LENGTH) {
-				throw new Error("getPageData array is too large");
+			if (value.length > PAGE_SERIALIZABLE_MAX_ARRAY_LENGTH) {
+				throw new Error("page array is too large");
 			}
 			return value.map((item) =>
 				normalizePageDataSerializableValue(item, depth + 1, seen),
 			);
 		}
-		if (!isPageDataPlainObject(value)) {
-			throw new Error("getPageData object must be plain");
+		if (!isPageSerializablePlainObject(value)) {
+			throw new Error("page object must be plain");
 		}
 		const result = Object.create(null);
 		const entries = Object.entries(value);
-		if (entries.length > PAGE_DATA_MAX_OBJECT_KEYS) {
-			throw new Error("getPageData object has too many keys");
+		if (entries.length > PAGE_SERIALIZABLE_MAX_OBJECT_KEYS) {
+			throw new Error("page object has too many keys");
 		}
 		for (const [key, entryValue] of entries) {
-			if (key.length > PAGE_DATA_MAX_OBJECT_KEY_LENGTH) {
-				throw new Error("getPageData object key is too long");
+			if (key.length > PAGE_SERIALIZABLE_MAX_OBJECT_KEY_LENGTH) {
+				throw new Error("page object key is too long");
 			}
-			if (!isSafePageDataObjectKey(key)) {
-				throw new Error("getPageData object key is not allowed");
+			if (!isSafePageSerializableObjectKey(key)) {
+				throw new Error("page object key is not allowed");
 			}
 			result[key] = normalizePageDataSerializableValue(
 				entryValue,
@@ -421,19 +458,30 @@ function normalizePageCallNumber(value, label) {
 	return value;
 }
 
-function normalizePageCallString(value, label) {
+function normalizePageCallString(
+	value,
+	label,
+	maxLength = PAGE_CALL_MAX_EVENT_STRING_LENGTH,
+) {
 	if (typeof value !== "string") {
 		throw new Error(`${label} must be a string`);
 	}
-	if (value.length > PAGE_CALL_MAX_EVENT_STRING_LENGTH) {
+	if (value.length > maxLength) {
 		throw new Error(`${label} is too long`);
+	}
+	return value;
+}
+
+function normalizePageCallInteger(value, label, minimum = -Infinity) {
+	if (!Number.isInteger(value) || value < minimum) {
+		throw new Error(`${label} must be an integer`);
 	}
 	return value;
 }
 
 function normalizePageCallEventSpec(spec) {
 	const normalizedSpec = normalizePageDataSerializableValue(spec);
-	if (!isPageDataPlainObject(normalizedSpec)) {
+	if (!isPageSerializablePlainObject(normalizedSpec)) {
 		throw new Error("page.call event spec must be a plain object");
 	}
 	const hasOwn = (key) =>
@@ -580,17 +628,275 @@ function normalizePageCallEventSpec(spec) {
 	return result;
 }
 
+function normalizePageCallAttribute(attribute) {
+	if (typeof attribute !== "string" || !attribute.trim()) {
+		throw new Error("page.call attribute must be a non-empty string");
+	}
+	if (attribute.length > PAGE_CALL_MAX_ATTRIBUTE_LENGTH) {
+		throw new Error("page.call attribute is too long");
+	}
+	return attribute;
+}
+
+function normalizePageCallProperty(property) {
+	const normalizedProperty = normalizePageCallString(
+		property,
+		"page.call property",
+		PAGE_CALL_MAX_PROPERTY_LENGTH,
+	);
+	if (!normalizedProperty.length) {
+		throw new Error("page.call property must be a non-empty string");
+	}
+	if (!PAGE_CALL_ALLOWED_PROPERTIES.has(normalizedProperty)) {
+		throw new Error(`DOM property is not allowed: ${normalizedProperty}`);
+	}
+	return normalizedProperty;
+}
+
+function normalizePageCallValue(value) {
+	return normalizePageCallString(
+		value,
+		"page.call value",
+		PAGE_CALL_MAX_VALUE_LENGTH,
+	);
+}
+
+function normalizePageCallLocationFields(locationValue) {
+	if (locationValue === true) {
+		return [...PAGE_CALL_ALLOWED_LOCATION_FIELDS];
+	}
+	if (!Array.isArray(locationValue) || locationValue.length === 0) {
+		throw new Error(
+			"page.call page.snapshot location must be true or a non-empty array",
+		);
+	}
+	const fields = [];
+	const seen = new Set();
+	for (const value of locationValue) {
+		if (typeof value !== "string" || !value.length) {
+			throw new Error("page.call location field must be a non-empty string");
+		}
+		if (!PAGE_CALL_ALLOWED_LOCATION_FIELD_SET.has(value)) {
+			throw new Error(`page.call location field is not allowed: ${value}`);
+		}
+		if (seen.has(value)) continue;
+		seen.add(value);
+		fields.push(value);
+	}
+	return fields;
+}
+
+function normalizePageCallSnapshotQuerySpec(spec) {
+	const normalizedSpec = normalizePageDataSerializableValue(spec);
+	if (!isPageSerializablePlainObject(normalizedSpec)) {
+		throw new Error("page.call page.snapshot query spec must be a plain object");
+	}
+	const hasOwn = (key) =>
+		Object.prototype.hasOwnProperty.call(normalizedSpec, key);
+	const kind = normalizePageCallString(
+		normalizedSpec.kind,
+		"page.call page.snapshot query kind",
+	);
+	if (!PAGE_CALL_ALLOWED_SNAPSHOT_QUERY_KINDS.has(kind)) {
+		throw new Error(`page.call page.snapshot query kind is not allowed: ${kind}`);
+	}
+	const result = Object.create(null);
+	result.kind = kind;
+	result.selector = normalizePageCallSelector(normalizedSpec.selector);
+	if (
+		["text", "html", "outerHtml", "exists", "rect", "classList", "allText", "count"].includes(
+			kind,
+		)
+	) {
+		if (Object.keys(normalizedSpec).some((key) => !["kind", "selector"].includes(key))) {
+			throw new Error(
+				`page.call page.snapshot ${kind} query has unsupported keys`,
+			);
+		}
+		return result;
+	}
+	if (["attr", "allAttr"].includes(kind)) {
+		if (
+			Object.keys(normalizedSpec).some(
+				(key) => !["kind", "selector", "attribute"].includes(key),
+			)
+		) {
+			throw new Error(
+				`page.call page.snapshot ${kind} query has unsupported keys`,
+			);
+		}
+		result.attribute = normalizePageCallAttribute(normalizedSpec.attribute);
+		return result;
+	}
+	if (["property", "allProperty"].includes(kind)) {
+		if (
+			Object.keys(normalizedSpec).some(
+				(key) => !["kind", "selector", "property"].includes(key),
+			)
+		) {
+			throw new Error(
+				`page.call page.snapshot ${kind} query has unsupported keys`,
+			);
+		}
+		result.property = normalizePageCallProperty(normalizedSpec.property);
+		return result;
+	}
+	if (
+		Object.keys(normalizedSpec).some(
+			(key) => !["kind", "selector"].includes(key),
+		)
+	) {
+		throw new Error(`page.call page.snapshot ${kind} query has unsupported keys`);
+	}
+	return result;
+}
+
+function normalizePageCallSnapshotSpec(spec) {
+	const normalizedSpec = normalizePageDataSerializableValue(spec);
+	if (!isPageSerializablePlainObject(normalizedSpec)) {
+		throw new Error("page.call page.snapshot spec must be a plain object");
+	}
+	const allowedKeys = new Set([
+		"title",
+		"location",
+		"readyState",
+		"visibility",
+		"selectionText",
+		"queries",
+	]);
+	for (const key of Object.keys(normalizedSpec)) {
+		if (!allowedKeys.has(key)) {
+			throw new Error(`page.call page.snapshot spec key is not allowed: ${key}`);
+		}
+	}
+	const hasOwn = (key) =>
+		Object.prototype.hasOwnProperty.call(normalizedSpec, key);
+	const result = Object.create(null);
+	if (hasOwn("title")) {
+		result.title = normalizePageCallBoolean(
+			normalizedSpec.title,
+			"page.call page.snapshot title",
+		);
+	}
+	if (hasOwn("location")) {
+		result.location = normalizePageCallLocationFields(normalizedSpec.location);
+	}
+	if (hasOwn("readyState")) {
+		result.readyState = normalizePageCallBoolean(
+			normalizedSpec.readyState,
+			"page.call page.snapshot readyState",
+		);
+	}
+	if (hasOwn("visibility")) {
+		result.visibility = normalizePageCallBoolean(
+			normalizedSpec.visibility,
+			"page.call page.snapshot visibility",
+		);
+	}
+	if (hasOwn("selectionText")) {
+		result.selectionText = normalizePageCallBoolean(
+			normalizedSpec.selectionText,
+			"page.call page.snapshot selectionText",
+		);
+	}
+	if (hasOwn("queries")) {
+		const queries = normalizedSpec.queries;
+		if (!isPageSerializablePlainObject(queries)) {
+			throw new Error("page.call page.snapshot queries must be a plain object");
+		}
+		const entries = Object.entries(queries);
+		if (entries.length > PAGE_CALL_MAX_SNAPSHOT_QUERIES) {
+			throw new Error("page.call page.snapshot has too many queries");
+		}
+		const normalizedQueries = Object.create(null);
+		for (const [key, value] of entries) {
+			if (!key.length) {
+				throw new Error("page.call page.snapshot query key must not be empty");
+			}
+			if (key.length > PAGE_CALL_MAX_SNAPSHOT_KEY_LENGTH) {
+				throw new Error("page.call page.snapshot query key is too long");
+			}
+			if (!isSafePageSerializableObjectKey(key)) {
+				throw new Error("page.call page.snapshot query key is not allowed");
+			}
+			normalizedQueries[key] = normalizePageCallSnapshotQuerySpec(value);
+		}
+		result.queries = normalizedQueries;
+	}
+	if (!Object.keys(result).length) {
+		throw new Error("page.call page.snapshot spec must request at least one field");
+	}
+	return result;
+}
+
 function normalizePageCallArgs(operation, args) {
 	if (!Array.isArray(args)) {
 		throw new Error("page.call arguments must be an array");
 	}
 	switch (operation) {
+		case "dom.exists":
+		case "dom.count":
 		case "dom.queryText":
+		case "dom.queryHtml":
+		case "dom.queryOuterHtml":
+		case "dom.queryRect":
+		case "dom.queryClassList":
+		case "dom.queryAllText":
 		case "dom.click":
+		case "dom.focus":
+		case "dom.blur":
 			if (args.length !== 1) {
 				throw new Error(`page.call ${operation} expects exactly 1 argument`);
 			}
 			return [normalizePageCallSelector(args[0])];
+		case "dom.queryAttr":
+		case "dom.queryAllAttr":
+			if (args.length !== 2) {
+				throw new Error(`page.call ${operation} expects exactly 2 arguments`);
+			}
+			return [
+				normalizePageCallSelector(args[0]),
+				normalizePageCallAttribute(args[1]),
+			];
+		case "dom.queryProperty":
+		case "dom.queryAllProperty":
+			if (args.length !== 2) {
+				throw new Error(`page.call ${operation} expects exactly 2 arguments`);
+			}
+			return [
+				normalizePageCallSelector(args[0]),
+				normalizePageCallProperty(args[1]),
+			];
+		case "dom.setValue":
+			if (args.length !== 2) {
+				throw new Error("page.call dom.setValue expects exactly 2 arguments");
+			}
+			return [
+				normalizePageCallSelector(args[0]),
+				normalizePageCallValue(args[1]),
+			];
+		case "dom.setChecked":
+			if (args.length !== 2) {
+				throw new Error("page.call dom.setChecked expects exactly 2 arguments");
+			}
+			return [
+				normalizePageCallSelector(args[0]),
+				normalizePageCallBoolean(args[1], "page.call checked"),
+			];
+		case "dom.setSelectedIndex":
+			if (args.length !== 2) {
+				throw new Error(
+					"page.call dom.setSelectedIndex expects exactly 2 arguments",
+				);
+			}
+			return [
+				normalizePageCallSelector(args[0]),
+				normalizePageCallInteger(
+					args[1],
+					"page.call selectedIndex",
+					-1,
+				),
+			];
 		case "event.dispatch":
 			if (args.length !== 2) {
 				throw new Error("page.call event.dispatch expects exactly 2 arguments");
@@ -599,48 +905,31 @@ function normalizePageCallArgs(operation, args) {
 				normalizePageCallSelector(args[0]),
 				normalizePageCallEventSpec(args[1]),
 			];
+		case "page.getTitle":
+		case "page.getLocation":
+		case "page.getReadyState":
+		case "page.getVisibility":
+		case "page.getSelectionText":
+			if (args.length !== 0) {
+				throw new Error(`page.call ${operation} expects exactly 0 arguments`);
+			}
+			return [];
+		case "page.snapshot":
+			if (args.length !== 1) {
+				throw new Error("page.call page.snapshot expects exactly 1 argument");
+			}
+			return [normalizePageCallSnapshotSpec(args[0])];
 		default:
 			throw new Error(`Unsupported page operation: ${operation}`);
 	}
 }
 
-async function getPageData(extractor, ...args) {
-	if (typeof extractor !== "function") {
-		return Promise.reject(new Error("getPageData requires a function extractor"));
-	}
-	let extractorSource;
-	try {
-		extractorSource = safeFunctionToString(extractor);
-	} catch (error) {
-		return Promise.reject(error);
-	}
-	if (pageDataByteLength(extractorSource) > PAGE_DATA_MAX_EXTRACTOR_BYTES) {
-		return Promise.reject(new Error("getPageData extractor is too large"));
-	}
-	const normalizedArgs = normalizePageDataSerializableValue(args);
-	const argsJson = JSON.stringify(normalizedArgs);
-	if (pageDataByteLength(argsJson) > PAGE_DATA_MAX_ARGS_BYTES) {
-		return Promise.reject(new Error("getPageData arguments are too large"));
-	}
-	let releasePageDataCall;
-	try {
-		releasePageDataCall = reservePageDataCall();
-	} catch (error) {
-		return Promise.reject(error);
-	}
-	return runPageTaskViaBackground({
-		backgroundTask: {
-			kind: "getPageData",
-			extractorSource,
-			argsJson,
-		},
-		defaultErrorMessage: "getPageData failed",
-		maxResultBytes: PAGE_DATA_MAX_RESULT_BYTES,
-		oversizedResultMessage: "Page data result is too large",
-		release: releasePageDataCall,
-		timeoutMessage: "getPageData timed out",
-		timeoutMs: PAGE_DATA_TIMEOUT_MS,
-	});
+async function getPageData() {
+	return Promise.reject(
+		new Error(
+			"GM.getPageData(extractor) is no longer supported. Use GM.page.call(operation, ...args).",
+		),
+	);
 }
 
 async function pageCall(operation, ...args) {

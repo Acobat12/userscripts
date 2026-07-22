@@ -154,7 +154,7 @@ Userscripts Safari currently supports the following userscript metadata:
   - allows the user to choose which context to inject the script into
   - values: `auto` (default), `content`, `page`
     - `GM` apis are only available when using `content`
-    - when a script uses `@grant`, page/auto injection is forced to `content`; use secure page APIs where supported, and prefer `GM.page.call(...)` for explicit page-context interactions
+    - when a script uses `@grant`, page/auto injection is forced to `content`; use `GM.page.call(...)` for page-context interactions
   - works like [violentmonkey](https://violentmonkey.github.io/api/metadata-block/#inject-into)
 - `@run-at`
   - allows the user to choose the injection timing
@@ -219,57 +219,24 @@ For API type definitions, please refer to: [`types.d.ts`](https://github.com/use
   - `css: String`
   - returns a [`Promise`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise), resolved if succeeds, rejected with error message if fails
 - `GM.getPageData(extractor, ...args)`
-  - `extractor: Function`
-  - `args: Any[]` - optional, must be JSON-serializable
-  - runs the provided extractor function in the page context and returns only plain JSON-serializable data
-  - requires a secure browser-mediated transport that can execute the extractor in `MAIN` world **without** relying on page-controlled bridges or dynamic `unsafe-eval`
-  - functions, DOM nodes, class instances, blobs, streams, and other active objects are rejected
-  - reserved object keys such as `__proto__`, `constructor`, and `prototype` are rejected
-  - returned values are untrusted page data, not privileged handles
-  - browser-mediated transport hardens the return path, but the result is still page-controlled because `MAIN` world code shares the page environment
-  - timeout only rejects the waiting Promise; it cannot interrupt already-running page JavaScript such as an infinite loop
-  - this API may be unavailable on platforms where a secure transport for arbitrary extractor execution is not supported
-  - use this when a script needs page globals while still keeping `GM_*` APIs in the content-script context, and only when the current platform supports it securely
-  - preferred for **reading** page state
-  - typical grants:
+  - deprecated compatibility entrypoint
+  - arbitrary extractor execution in `MAIN` world is no longer supported
+  - always rejects with:
 
 ```js
-// @grant GM.getPageData
+GM.getPageData(extractor) is no longer supported. Use GM.page.call(operation, ...args).
 ```
 
 ```js
-const state = await GM.getPageData(() => ({
-  userId: window.app?.user?.id ?? null,
-  tokenPresent: Boolean(window.app?.token),
-  title: document.title,
-}));
-
-if (
-  !state ||
-  typeof state !== "object" ||
-  typeof state.userId !== "string"
-) {
-  throw new Error("Invalid page data");
+try {
+  await GM.getPageData(() => document.title);
+} catch (error) {
+  console.warn(String(error));
 }
 ```
 
-```js
-const text = await GM.getPageData(
-  (selector) => document.querySelector(selector)?.textContent ?? null,
-  "#status",
-);
-```
-
-  - recommended:
-    - keep the extractor small and self-contained
-    - return only the fields you actually need
-    - validate the returned shape before using it
-    - handle explicit runtime rejection on platforms that do not support secure extractor execution
-  - do not:
-    - return DOM nodes, functions, promises that never settle, or large object graphs
-    - assume the returned data is trustworthy just because it came from your own extractor
-    - use an infinite loop or long-running extractor and expect timeout to stop it
-  - returns a [`Promise`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise), resolved with the extractor result if succeeds, rejected with error message if fails
+  - migrate to `GM.page.call(...)`
+  - keeping the method allows older scripts to fail with a clear migration message instead of silently using an unsafe fallback
 - `GM.page.call(operation, ...args)`
   - requires `@grant GM.page` or `@grant GM.page.call`
   - runs a narrow allowlisted page-world operation and returns only plain JSON-serializable data
@@ -277,10 +244,14 @@ const text = await GM.getPageData(
   - this is not `unsafeWindow`; it does not expose page object references or arbitrary evaluation
   - currently supported operations:
   - `GM.page.call("dom.queryText", selector)` - returns the first matched element's `textContent` or `null`
+  - `GM.page.call("dom.queryAttr", selector, attribute)` - returns the first matched element's attribute value or `null`
+  - `GM.page.call("dom.queryProperty", selector, property)` - returns an allowlisted property value such as `value`, `checked`, `disabled`, `selectedIndex`, `href`, `src`, or `title`
   - `GM.page.call("dom.click", selector)` - clicks the first matched element and returns `true` if found
   - `GM.page.call("event.dispatch", selector, eventSpec)` - dispatches an allowlisted `Event`, `CustomEvent`, `MouseEvent`, `KeyboardEvent`, or `InputEvent`
+  - `GM.page.call("page.getLocation")` - returns a plain snapshot of `location` fields such as `href`, `origin`, `pathname`, `search`, and `hash`
+  - `GM.page.call("page.snapshot", spec)` - batches several allowlisted reads into one round trip
   - results remain untrusted page-controlled data
-  - preferred for **small, explicit interactions** with page DOM when `GM.getPageData()` is not enough
+  - preferred as the default safe page API for page-context reads and actions
   - typical grants:
 
 ```js
@@ -297,10 +268,36 @@ if (typeof label === "string") {
 ```
 
 ```js
+const href = await GM.page.call("dom.queryAttr", "a.profile", "href");
+const fieldValue = await GM.page.call("dom.queryProperty", "input[name=q]", "value");
+```
+
+```js
+const exists = await GM.page.call("dom.exists", ".dialog");
+const itemCount = await GM.page.call("dom.count", ".result-item");
+const classes = await GM.page.call("dom.queryClassList", ".dialog");
+const rect = await GM.page.call("dom.queryRect", ".dialog");
+```
+
+```js
+const html = await GM.page.call("dom.queryHtml", ".profile-card");
+const outerHtml = await GM.page.call("dom.queryOuterHtml", ".profile-card");
+const texts = await GM.page.call("dom.queryAllText", ".result-item");
+const hrefs = await GM.page.call("dom.queryAllAttr", "a.result", "href");
+```
+
+```js
 const clicked = await GM.page.call("dom.click", "button.submit");
 if (!clicked) {
   console.warn("Submit button not found");
 }
+```
+
+```js
+await GM.page.call("dom.focus", "input.search");
+await GM.page.call("dom.setValue", "input.search", "hello");
+await GM.page.call("dom.setChecked", "input[type=checkbox]", true);
+await GM.page.call("dom.setSelectedIndex", "select.sort", 2);
 ```
 
 ```js
@@ -323,21 +320,80 @@ await GM.page.call("event.dispatch", "#app", {
 });
 ```
 
+```js
+const title = await GM.page.call("page.getTitle");
+const readyState = await GM.page.call("page.getReadyState");
+const visibility = await GM.page.call("page.getVisibility");
+const selectionText = await GM.page.call("page.getSelectionText");
+```
+
+```js
+const pageInfo = await GM.page.call("page.getLocation");
+console.log(pageInfo.pathname, pageInfo.hash);
+```
+
+```js
+const snapshot = await GM.page.call("page.snapshot", {
+  title: true,
+  location: ["pathname", "search"],
+  readyState: true,
+  visibility: true,
+  selectionText: true,
+  queries: {
+    profileName: {
+      kind: "text",
+      selector: ".profile-name",
+    },
+    profileHtml: {
+      kind: "html",
+      selector: ".profile-card",
+    },
+    profileHref: {
+      kind: "attr",
+      selector: "a.profile",
+      attribute: "href",
+    },
+    searchValue: {
+      kind: "property",
+      selector: "input[name=q]",
+      property: "value",
+    },
+    resultCount: {
+      kind: "count",
+      selector: ".result-item",
+    },
+    resultTexts: {
+      kind: "allText",
+      selector: ".result-item",
+    },
+  },
+});
+```
+
+  - supported operations:
+    - DOM reads: `dom.exists`, `dom.count`, `dom.queryText`, `dom.queryHtml`, `dom.queryOuterHtml`, `dom.queryAttr`, `dom.queryProperty`, `dom.queryRect`, `dom.queryClassList`, `dom.queryAllText`, `dom.queryAllAttr`, `dom.queryAllProperty`
+    - DOM actions: `dom.click`, `dom.focus`, `dom.blur`, `dom.setValue`, `dom.setChecked`, `dom.setSelectedIndex`, `event.dispatch`
+    - page reads: `page.getTitle`, `page.getLocation`, `page.getReadyState`, `page.getVisibility`, `page.getSelectionText`, `page.snapshot`
+  - `page.snapshot` query kinds:
+    - `text`, `html`, `outerHtml`, `attr`, `property`, `exists`, `rect`, `classList`, `allText`, `allAttr`, `allProperty`, `count`
   - recommended:
-    - use `GM.page.call(...)` only for a small allowlisted action
+    - use `GM.page.call(...)` only for a small allowlisted action or read
     - prefer stable selectors that you control or validate carefully
     - check boolean and nullable results explicitly
+    - prefer `page.snapshot` when you need a few related reads in one round trip
   - do not:
     - treat this API like generic page evaluation
     - build a higher-level `eval` or arbitrary method-call layer on top of it
     - pass unvalidated user input directly into selectors or event payloads
     - assume that a dispatched event guarantees the page accepted or processed it
+    - use `dom.queryProperty` or `dom.queryAllProperty` as a loophole to expose arbitrary DOM objects; only the documented scalar allowlist is supported
+    - treat `dom.setValue` / `dom.setChecked` / `dom.setSelectedIndex` as proof that the page reacted; they only perform the allowlisted DOM mutation
   - returns a [`Promise`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Promise), resolved with the operation result if succeeds, rejected with error message if fails
 
 #### Safe Page Access Guidance
 
-- Prefer `GM.getPageData()` only when the current platform explicitly supports a secure extractor transport.
-- Prefer `GM.page.call(...)` as the default safe page API when you need one small DOM interaction such as reading text, clicking, or dispatching a simple event.
+- Prefer `GM.page.call(...)` as the single safe page API.
+- Migrate older `GM.getPageData(() => ...)` code to one or more explicit `GM.page.call(...)` operations.
 - Do **not** use either API as a substitute for `unsafeWindow`.
 - Treat all returned values as **page-controlled input**. Validate them before using them in privileged logic.
 - Keep selectors narrow and predictable. Broad selectors such as `"div"` or `"*"` are brittle and easy to misuse.
