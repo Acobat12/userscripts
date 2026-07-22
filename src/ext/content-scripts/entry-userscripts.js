@@ -21,6 +21,65 @@ function normalizeInjectInto(value) {
 	return value === "page" || value === "content" ? value : "auto";
 }
 
+const supportedGrantNames = new Set([
+	"GM.info",
+	"GM_info",
+	"GM.addStyle",
+	"GM.getPageData",
+	"GM.page",
+	"GM.page.call",
+	"GM.openInTab",
+	"GM.closeTab",
+	"GM.setValue",
+	"GM.getValue",
+	"GM.deleteValue",
+	"GM.listValues",
+	"GM.setClipboard",
+	"GM.getTab",
+	"GM.saveTab",
+	"GM_xmlhttpRequest",
+	"GM.xmlHttpRequest",
+	"none",
+]);
+
+function recoverGrantsFromMetaBlock(userscript) {
+	const currentGrants = Array.isArray(userscript.scriptObject.grant)
+		? userscript.scriptObject.grant
+		: [];
+	if (currentGrants.length > 0) {
+		return currentGrants;
+	}
+	const scriptMetaStr = userscript.scriptMetaStr;
+	if (typeof scriptMetaStr !== "string" || !scriptMetaStr.includes("@grant")) {
+		return currentGrants;
+	}
+	const recoveredGrants = [];
+	const seenGrants = new Set();
+	for (const line of scriptMetaStr.split(/\r?\n/u)) {
+		const match = line
+			.trim()
+			.match(/^(?:\/\/\s*)?@grant[ \t]+([^\s]+[^\r\n\t\v\f]*)/u);
+		if (!match) continue;
+		const grant = match[1];
+		if (grant === "none") {
+			userscript.scriptObject.grant = [];
+			return userscript.scriptObject.grant;
+		}
+		if (!supportedGrantNames.has(grant) || seenGrants.has(grant)) {
+			continue;
+		}
+		seenGrants.add(grant);
+		recoveredGrants.push(grant);
+	}
+	if (recoveredGrants.length > 0) {
+		console.warn(
+			`${userscript.scriptObject.filename} returned an empty grant list from runtime; recovered grants from scriptMetaStr.`,
+		);
+		userscript.scriptObject.grant = recoveredGrants;
+	}
+	return userscript.scriptObject.grant;
+}
+
 function triageJS(userscript) {
 	const runAt = userscript.scriptObject["run-at"];
 	if (runAt === "document-start") {
@@ -171,7 +230,7 @@ async function injection() {
 	for (let i = 0; i < scripts.length; i++) {
 		const userscript = scripts[i];
 		const filename = userscript.scriptObject.filename;
-		const grants = userscript.scriptObject.grant;
+		const grants = recoverGrantsFromMetaBlock(userscript);
 		const connect = userscript.scriptObject.connect;
 		const hasConnectMetadata = Object.prototype.hasOwnProperty.call(
 			userscript.scriptObject,

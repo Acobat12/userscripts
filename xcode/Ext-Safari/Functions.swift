@@ -1233,7 +1233,8 @@ func getCode(_ filenames: [String], _ isTop: Bool)-> [String: Any]? {
 		}
 
 		// attempt to get all @grant value
-		var grants = metadata["grant"] ?? []
+		let rawGrants = metadata["grant"] ?? []
+		var grants = rawGrants
 
 		if !grants.isEmpty {
 			if grants.contains("none") {
@@ -1245,6 +1246,11 @@ func getCode(_ filenames: [String], _ isTop: Bool)-> [String: Any]? {
 				// filter out grant values that are not in validGrant set
 				grants = grants.filter{validGrants.contains($0)}
 			}
+		}
+		if !rawGrants.isEmpty && grants.isEmpty {
+			logger?.error(
+				"\(#function, privacy: .public) - all @grant values were filtered out for \(filename, privacy: .public): \(rawGrants.joined(separator: ", "), privacy: .public)"
+			)
 		}
 		
 

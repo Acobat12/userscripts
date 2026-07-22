@@ -175,7 +175,7 @@ globalThis.__entryUserscriptsGrantRegression = {
 			inherit: "",
 			blue: "",
 		};
-		vm.runInThisContext(runtimeSource, {
+		vm.runInThisContext(`(() => {\n${runtimeSource}\n})();`, {
 			filename: entryUserscriptsUrl.pathname,
 		});
 		await flushTasks();
@@ -206,6 +206,130 @@ globalThis.__entryUserscriptsGrantRegression = {
 			delete globalThis.__entryUserscriptsGrantRegression;
 		} else {
 			globalThis.__entryUserscriptsGrantRegression = originalMarker;
+		}
+	}
+});
+
+test("empty runtime grant arrays are recovered from scriptMetaStr before API injection", async () => {
+	const document = new FakeDocument();
+	const windowObject = {
+		self: null,
+		top: null,
+		location: {
+			href: "https://example.test/",
+			origin: "https://example.test",
+			toString() {
+				return this.href;
+			},
+		},
+	};
+	windowObject.self = windowObject;
+	windowObject.top = windowObject;
+
+	const userscript = {
+		code: `
+globalThis.__entryUserscriptsRecoveredGrantRegression = {
+	grant: Array.isArray(GM?.info?.script?.grant) ? [...GM.info.script.grant] : null,
+	getPageData: typeof GM?.getPageData,
+	pageCall: typeof GM?.page?.call,
+};
+`,
+		scriptMetaStr: `// ==UserScript==
+// @name        Regression Script
+// @grant       GM.getPageData
+// @grant       GM.page.call
+// ==/UserScript==`,
+		scriptObject: {
+			filename: "recovered-grants.user.js",
+			name: "Recovered Grant Regression Script",
+			grant: [],
+			"run-at": "document-start",
+		},
+	};
+
+	const response = {
+		files: {
+			js: [userscript],
+			menu: [],
+			css: [],
+		},
+		scriptHandler: "Userscripts",
+		scriptHandlerVersion: "test",
+	};
+
+	const originalDocument = globalThis.document;
+	const originalWindow = globalThis.window;
+	const originalBrowser = globalThis.browser;
+	const originalLocation = globalThis.location;
+	const originalMarker = globalThis.__entryUserscriptsRecoveredGrantRegression;
+	const originalTestUsapi = globalThis.__ENTRY_USERSCRIPTS_TEST_USAPI;
+	const originalTestColors = globalThis.__ENTRY_USERSCRIPTS_TEST_COLORS;
+
+	globalThis.document = document;
+	globalThis.window = windowObject;
+	globalThis.browser = createBrowser(response);
+	globalThis.location = windowObject.location;
+	delete globalThis.__entryUserscriptsRecoveredGrantRegression;
+
+	try {
+		const apiModuleUrl = new URL(
+			"../../../src/ext/content-scripts/api.js",
+			import.meta.url,
+		);
+		const { default: USAPI } = await import(apiModuleUrl.href);
+		const entryUserscriptsUrl = new URL(
+			"../../../src/ext/content-scripts/entry-userscripts.js",
+			import.meta.url,
+		);
+		const source = await readFile(entryUserscriptsUrl, "utf8");
+		const runtimeSource = source.replace(
+			/^import USAPI from "\.\/api\.js";\r?\nimport \{ colors \} from "@shared\/colors\.js";\r?\n/,
+			[
+				"const USAPI = globalThis.__ENTRY_USERSCRIPTS_TEST_USAPI;",
+				"const colors = globalThis.__ENTRY_USERSCRIPTS_TEST_COLORS;",
+				"",
+			].join("\n"),
+		);
+		globalThis.__ENTRY_USERSCRIPTS_TEST_USAPI = USAPI;
+		globalThis.__ENTRY_USERSCRIPTS_TEST_COLORS = {
+			yellow: "",
+			inherit: "",
+			blue: "",
+		};
+		vm.runInThisContext(`(() => {\n${runtimeSource}\n})();`, {
+			filename: entryUserscriptsUrl.pathname,
+		});
+		await flushTasks();
+
+		assert.equal(userscript.forceContentInjection, true);
+		assert.deepEqual(userscript.scriptObject.grant, [
+			"GM.getPageData",
+			"GM.page.call",
+		]);
+		assert.deepEqual(globalThis.__entryUserscriptsRecoveredGrantRegression, {
+			grant: ["GM.getPageData", "GM.page.call"],
+			getPageData: "function",
+			pageCall: "function",
+		});
+	} finally {
+		globalThis.document = originalDocument;
+		globalThis.window = originalWindow;
+		globalThis.browser = originalBrowser;
+		globalThis.location = originalLocation;
+		if (originalTestUsapi === undefined) {
+			delete globalThis.__ENTRY_USERSCRIPTS_TEST_USAPI;
+		} else {
+			globalThis.__ENTRY_USERSCRIPTS_TEST_USAPI = originalTestUsapi;
+		}
+		if (originalTestColors === undefined) {
+			delete globalThis.__ENTRY_USERSCRIPTS_TEST_COLORS;
+		} else {
+			globalThis.__ENTRY_USERSCRIPTS_TEST_COLORS = originalTestColors;
+		}
+		if (originalMarker === undefined) {
+			delete globalThis.__entryUserscriptsRecoveredGrantRegression;
+		} else {
+			globalThis.__entryUserscriptsRecoveredGrantRegression = originalMarker;
 		}
 	}
 });
